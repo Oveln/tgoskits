@@ -67,6 +67,7 @@ members = [
 
     "drivers/ax-driver",
     "drivers/blk/*",
+    "drivers/ipc/*",
     "drivers/examples/*",
     "drivers/firmware/*",
     "drivers/gpu/*",
@@ -334,3 +335,4 @@ bcm2835-sdhci = "0.1.1-preview.1"
 x86 = "0.52"
 kmod-tools = "0.3"
 kprobe = "0.6"
+rt-shm = { version = "0.1.0", path = "drivers/ipc/rt-shm" }

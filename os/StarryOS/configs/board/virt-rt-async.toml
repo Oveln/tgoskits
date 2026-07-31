@@ -1,0 +1,24 @@
+# StarryOS board config for the AMP QEMU virt-rt-async target.
+#
+# StarryOS on hart 0, paired with rt-async real-time kernel on hart 1.
+# Uses plat-dyn (FDT-based runtime platform detection) to avoid a custom
+# platform crate — the FDT already describes all QEMU virt devices.
+
+env = {}
+features = [
+  "plat-dyn",
+  "ax-runtime/display",
+  "ax-runtime/rtc",
+  "ax-driver/serial",
+  "ax-driver/virtio-blk",
+  "ax-driver/virtio-net",
+  "ax-driver/virtio-gpu",
+  "ax-driver/virtio-input",
+  "ax-driver/virtio-socket",
+  "starry-kernel/input",
+  "starry-kernel/vsock",
+]
+
+log = "Info"
+plat_dyn = true
+target = "riscv64gc-unknown-none-elf"

@@ -433,8 +433,15 @@ pub(crate) fn init_percpu_irq(cpu_id: usize) {
             .expect("failed to register timer IRQ handler");
 
         #[cfg(any(feature = "ipi", feature = "wake-ipi"))]
-        ax_hal::irq::request_percpu_irq(ax_hal::irq::ipi_irq(), cpus, ipi_irq_handler)
-            .expect("failed to register IPI IRQ handler");
+        // AMP: 用 request_irq + ShareMode::Shared 注册 IPI，让 rt_shm 能共享同一 IRQ line
+        // （upstream 的 IrqRequest::new 只接受 handler，无 unit_data；参考 klib.rs 用法）
+        ax_hal::irq::request_irq(
+            ax_hal::irq::ipi_irq(),
+            ax_hal::irq::IrqRequest::new(ipi_irq_handler)
+                .share_mode(ax_hal::irq::ShareMode::Shared)
+                .scope(ax_hal::irq::IrqScope::PerCpu { cpus }),
+        )
+        .expect("failed to register IPI IRQ handler");
     }
 
     init_timer();

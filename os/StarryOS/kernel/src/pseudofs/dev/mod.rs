@@ -30,6 +30,7 @@ pub(super) mod pwm;
 #[cfg(feature = "rga")]
 pub(crate) mod rga;
 mod rtc;
+mod rt_shm;
 #[cfg(feature = "sg2002")]
 pub mod tpu;
 pub mod tty;
@@ -592,6 +593,23 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             Arc::new(rtc::Rtc),
         ),
     );
+    // /dev/rt_shm — AMP shared-memory IPC with the real-time core.
+    // Only registered when the FDT contains an "ov,rt-async-amp" compatible
+    // node; all runtime parameters (SHM region, notifier, IRQ) are read
+    // from that node, replacing the old amp.toml-driven constants.
+    if let Some(cfg) = rt_shm::config() {
+        root.add(
+            "rt_shm",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                rt_shm::RT_SHM_DEVICE_ID,
+                Arc::new(rt_shm::RtShmDevice::new(cfg)),
+            ),
+        );
+    } else {
+        ax_println!("rt_shm: not available on this platform, skipping /dev/rt_shm");
+    }
 
     #[cfg(feature = "k230-kpu")]
     {

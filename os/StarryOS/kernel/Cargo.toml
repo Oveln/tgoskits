@@ -298,3 +298,4 @@ riscv.workspace = true
 
 [target.'cfg(not(any(target_arch = "aarch64", target_arch = "loongarch64")))'.dependencies]
 ax-page-table-multiarch = { workspace = true, features = ["copy-from"] }
+rt-shm = { workspace = true }

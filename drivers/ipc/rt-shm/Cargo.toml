@@ -1,0 +1,17 @@
+[package]
+name = "rt-shm"
+version = "0.1.0"
+edition = "2024"
+description = "Reusable AMP shared-memory IPC driver core (no_std, OS-independent)"
+license = "Apache-2.0"
+repository.workspace = true
+keywords = ["amp", "ipc", "shared-memory", "no_std", "embedded"]
+categories = ["embedded", "no-std", "hardware-support"]
+
+[dependencies]
+log = { workspace = true, optional = true }
+# ov-channels 提供共享内存通道的 ring-buffer 抽象。
+# features 必须与 M-mode 侧 (rt-async apps/rt-async-app) 保持一致：
+#   - "critical-section": portable-atomic 原子操作后端
+#   - "flags": SharedMemory 顶部带 busy 标志，影响 struct 布局 —— 双端必须一致
+ov-channels = { version = "0.2", default-features = false, features = ["critical-section", "flags"] }
