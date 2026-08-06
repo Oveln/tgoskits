@@ -7279,6 +7279,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rt-shm"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "ov-channels",
+]
+
+[[package]]
 name = "rust-hello"
 version = "0.1.0"
 
@@ -8256,6 +8264,7 @@ dependencies = [
  "riscv",
  "rockchip-rga",
  "rsext4",
+ "rt-shm",
  "scope-local",
  "sg2002-tpu",
  "sg200x-bsp",

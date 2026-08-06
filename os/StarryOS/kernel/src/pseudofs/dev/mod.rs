@@ -29,8 +29,8 @@ mod pinmux;
 pub(super) mod pwm;
 #[cfg(feature = "rga")]
 pub(crate) mod rga;
-mod rtc;
 mod rt_shm;
+mod rtc;
 #[cfg(feature = "sg2002")]
 pub mod tpu;
 pub mod tty;

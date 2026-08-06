@@ -9207,7 +9207,11 @@
 			reg = <0x00 0xcac91000 0x00 0x400>;
 			tx-channel = <0x00>;
 			rx-channel = <0x01>;
-			rx-interrupts = <0xd9>;
+			// 标准 interrupt binding：mailbox4 的 AP 方向中断线
+			// mailbox_irq4[0] → APLIC source 217（docs-chip 07_interrupts.md）。
+			// phandle 0x82 = interrupt-controller@e0804000（riscv,aplic）。
+			interrupt-parent = <0x82>;
+			interrupts = <0xd9 0x04>;
 		};
 	};
 };

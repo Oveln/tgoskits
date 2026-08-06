@@ -29,12 +29,12 @@
 //!
 //! On platforms without the node, the device is not created.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use ax_errno::AxError;
-use axfs_ng_vfs::{DeviceId, NodeFlags, VfsError, VfsResult};
 use ax_kspin::SpinNoIrq;
 use ax_memory_addr::{PhysAddr, PhysAddrRange};
+use axfs_ng_vfs::{DeviceId, NodeFlags, VfsError, VfsResult};
 use axpoll::{IoEvents, Pollable};
 use rt_shm::{
     ChannelId, DEFAULT_CHANNELS, Event, IpiIrqEndpoint, IpiSender, OvChannelsShmAccess, RtShmCore,
@@ -48,6 +48,9 @@ use crate::pseudofs::{DeviceMmap, DeviceOps};
 pub const RT_SHM_IOC_NOTIFY: u32 = 0x7350_01;
 pub const RT_SHM_IOC_AWAIT: u32 = 0x7350_02;
 pub const RT_SHM_IOC_CLR_PENDING: u32 = 0x7350_03;
+/// AP 端纯自测：软件注入一条 mailbox new_msg，验证中断全链路
+/// （mailbox → APLIC → IMSIC → CPU → handler），无需对端参与。
+pub const RT_SHM_IOC_TEST_MBOX: u32 = 0x7350_04;
 
 pub const RT_SHM_DEVICE_ID: DeviceId = DeviceId::new(10, 200);
 
@@ -69,12 +72,15 @@ pub struct RtAsyncConfig {
 }
 
 enum NotifierConfig {
-    ClintMsip { msip_phys: usize, ipi_irq: u32 },
+    ClintMsip {
+        msip_phys: usize,
+        ipi_irq: u32,
+    },
     K3Mailbox {
         mbox_phys: usize,
         tx_channel: u8,
         rx_channel: u8,
-        rx_irq: u32,
+        rx_irq: ax_runtime::hal::irq::IrqId,
     },
 }
 
@@ -92,12 +98,9 @@ fn parse_rt_async_from_fdt() -> Option<RtAsyncConfig> {
     let fdt = ax_runtime::hal::dtb::get_fdt()?;
 
     // 主节点：compatible = "ov,rt-async-amp"，且 status 非 "disabled"。
-    let node = fdt.find_compatible(&["ov,rt-async-amp"]).find(|n| {
-        !matches!(
-            n.find_property("status").map(|p| p.str()),
-            Some("disabled")
-        )
-    })?;
+    let node = fdt
+        .find_compatible(&["ov,rt-async-amp"])
+        .find(|n| !matches!(n.find_property("status").map(|p| p.str()), Some("disabled")))?;
 
     // SHM 区来自标准 `reg` (address-cells/size-cells 感知)。
     let reg = node.reg()?.next()?;
@@ -114,10 +117,7 @@ fn parse_rt_async_from_fdt() -> Option<RtAsyncConfig> {
     let notifier = if let Some(n) = fdt.find_compatible(&["ov,clint-msip-notifier"]).next() {
         match n.reg().and_then(|mut r| r.next()) {
             Some(nr) => {
-                let ipi_irq = n
-                    .find_property("ov,ipi-irq")
-                    .map(|p| p.u32())
-                    .unwrap_or(1);
+                let ipi_irq = n.find_property("ov,ipi-irq").map(|p| p.u32()).unwrap_or(1);
                 NotifierConfig::ClintMsip {
                     msip_phys: nr.address as usize,
                     ipi_irq,
@@ -139,10 +139,24 @@ fn parse_rt_async_from_fdt() -> Option<RtAsyncConfig> {
                     .find_property("rx-channel")
                     .map(|p| p.u32() as u8)
                     .unwrap_or(1);
-                let rx_irq = n
-                    .find_property("rx-interrupts")
-                    .map(|p| p.u32())
-                    .unwrap_or(217);
+                // mailbox 中断线解析：notifier 节点用标准 interrupt-parent +
+                // interrupts（mailbox_irq4[0] → APLIC source 217）。经 rdrive
+                // phandle → DeviceId → intc.translate_fdt 得到**带正确 domain**
+                // （K3 为 APLIC 动态 domain）的 IrqId，替代硬编码
+                // RISCV_PLIC_DOMAIN（固定保留 id，K3 上不可注册）。
+                //
+                // 解析失败（缺 interrupt-parent / controller 未注册 / specifier
+                // 非法）按配置不完整处理：跳过设备建设，而非 panic 内核。
+                let rx_irq = match k3_notifier_irq() {
+                    Some(irq) => irq,
+                    None => {
+                        ax_println!(
+                            "rt_shm: k3-mailbox-notifier missing/invalid interrupt binding, \
+                             skipping /dev/rt_shm"
+                        );
+                        return None;
+                    }
+                };
                 NotifierConfig::K3Mailbox {
                     mbox_phys: nr.address as usize,
                     tx_channel,
@@ -165,6 +179,26 @@ fn parse_rt_async_from_fdt() -> Option<RtAsyncConfig> {
         shm_size,
         notifier,
     })
+}
+
+/// 解析 `ov,k3-mailbox-notifier` 节点的标准 interrupt binding，返回带正确
+/// interrupt domain（K3 上为 APLIC 动态 domain）的 `IrqId`。
+///
+/// 经 rdrive 全局 FDT 找节点 → interrupt-parent phandle → DeviceId →
+/// `intc.translate_fdt` 的完整链路（与 kpu devfs 的中断解析一致），保证
+/// IRQ 注册落到真实的中断控制器 domain 上，而非硬编码的保留 domain id。
+fn k3_notifier_irq() -> Option<ax_runtime::hal::irq::IrqId> {
+    let interrupt = rdrive::with_fdt(|fdt| {
+        fdt.find_compatible(&["ov,k3-mailbox-notifier"])
+            .first()
+            .and_then(|node| node.interrupts().into_iter().next())
+    })??;
+    let controller = rdrive::fdt_phandle_to_device_id(interrupt.interrupt_parent)?;
+    ax_runtime::irq::resolve_binding_irq(ax_driver::BindingIrq::fdt_interrupt_with_controller(
+        controller,
+        interrupt.specifier.clone(),
+    ))
+    .ok()
 }
 
 // ── StarryOS Glue: CLINT IPI sender ────────────────────────────────────────
@@ -272,6 +306,17 @@ impl K3MboxMmio {
             k3_new_msg_mask(channel),
         );
     }
+
+    /// 自测用：模拟对端发来一条 new_msg，触发本端（USER0）的 new_msg 中断线
+    /// （mailbox_irq4[0] → APLIC → IMSIC → CPU → handler 全链路），不需要对端
+    /// 参与。写入会占用 FIFO 一槽，由中断 handler 的 ack_and_clear 读走。
+    fn inject_local_message(&self, channel: u8) {
+        self.write(
+            k3_irq_reg(self.user_local, K3_MBOX_IRQ_EN_SET_OFF),
+            k3_new_msg_mask(channel),
+        );
+        self.write(K3_MBOX_MSG_BASE + (channel as usize) * 4, 1);
+    }
 }
 
 struct K3MailboxIpiSender {
@@ -283,7 +328,8 @@ struct K3MailboxIpiSender {
 impl IpiSender for K3MailboxIpiSender {
     fn notify_peer(&mut self) {
         core::sync::atomic::fence(Ordering::Release);
-        self.mbox.signal_to_remote(self.tx_channel, self.user_remote);
+        self.mbox
+            .signal_to_remote(self.tx_channel, self.user_remote);
     }
 }
 
@@ -303,13 +349,14 @@ impl IpiIrqEndpoint for K3MailboxIrqEndpoint {
 
 static OPENED: AtomicBool = AtomicBool::new(false);
 static IPC_WAKER: SpinNoIrq<Option<core::task::Waker>> = SpinNoIrq::new(None);
+/// K3 mailbox new_msg 中断触发次数（自测用：ioctl TEST_MBOX 轮询此计数确认
+/// mailbox → APLIC → CPU → handler 全链路贯通）。
+static K3_MBOX_IRQ_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 // ── IPI handler (raw function pointer for irq-framework) ───────────────────
 
 #[cfg(target_arch = "riscv64")]
-fn ipi_irq_handler(
-    _ctx: ax_runtime::hal::irq::IrqContext,
-) -> ax_runtime::hal::irq::IrqReturn {
+fn ipi_irq_handler(_ctx: ax_runtime::hal::irq::IrqContext) -> ax_runtime::hal::irq::IrqReturn {
     if let Some(waker) = IPC_WAKER.lock().take() {
         waker.wake();
     }
@@ -336,6 +383,9 @@ pub struct RtShmDevice {
     core: SpinNoIrq<RtShmCore<OvChannelsShmAccess<DEFAULT_CHANNELS>, IpiBackend>>,
     shm_phys_base: usize,
     shm_size: usize,
+    /// K3 mailbox 自测句柄：仅 K3 分支构造时 Some，其余平台 None。
+    /// 供 ioctl TEST_MBOX 软件注入 new_msg，验证中断全链路。
+    test_mbox: Option<K3MboxMmio>,
 }
 
 impl RtShmDevice {
@@ -353,13 +403,14 @@ impl RtShmDevice {
         let shm: &'static SharedMemory<DEFAULT_CHANNELS> = unsafe { SharedMemory::at(vaddr) };
         let access = unsafe { OvChannelsShmAccess::new(shm, CH_FROM_RT_ASYNC) };
 
+        let mut test_mbox = None;
         let ipi: IpiBackend = match notifier {
             NotifierConfig::ClintMsip { msip_phys, ipi_irq } => {
                 #[cfg(target_arch = "riscv64")]
                 {
                     use ax_runtime::hal::irq::{
-                        AutoEnable, CpuMask, HwIrq, IrqId, IrqRequest, IrqScope, ShareMode,
-                        CPU_LOCAL_IRQ_DOMAIN, request_irq,
+                        AutoEnable, CPU_LOCAL_IRQ_DOMAIN, CpuMask, HwIrq, IrqId, IrqRequest,
+                        IrqScope, ShareMode, request_irq,
                     };
                     let irq = IrqId::new(CPU_LOCAL_IRQ_DOMAIN, HwIrq(ipi_irq as _));
                     let cpus = CpuMask::first_n(ax_runtime::hal::cpu_num());
@@ -398,19 +449,17 @@ impl RtShmDevice {
                 let mbox_rx = K3MboxMmio::new(mbox_base, 0);
                 let mbox_tx = K3MboxMmio::new(mbox_base, 0);
                 mbox_rx.enable_rx(rx_channel);
+                test_mbox = Some(K3MboxMmio::new(mbox_base, 0));
 
                 #[cfg(target_arch = "riscv64")]
                 {
-                    use ax_runtime::hal::irq::{
-                        AutoEnable, HwIrq, IrqId, IrqRequest, ShareMode, RISCV_PLIC_DOMAIN,
-                        request_irq,
-                    };
+                    use ax_runtime::hal::irq::{AutoEnable, IrqRequest, ShareMode, request_irq};
                     let mut endpoint = K3MailboxIrqEndpoint {
                         mbox: mbox_rx,
                         rx_channel,
                     };
-                    let irq = IrqId::new(RISCV_PLIC_DOMAIN, HwIrq(rx_irq as _));
                     let request = IrqRequest::new(move |_ctx| {
+                        K3_MBOX_IRQ_COUNT.fetch_add(1, Ordering::AcqRel);
                         let event = endpoint.handle_irq();
                         if event == Event::PeerNotify {
                             if let Some(waker) = IPC_WAKER.lock().take() {
@@ -421,10 +470,11 @@ impl RtShmDevice {
                     })
                     .share_mode(ShareMode::Shared)
                     .auto_enable(AutoEnable::Yes);
-                    match request_irq(irq, request) {
+                    match request_irq(rx_irq, request) {
                         Ok(_) => ax_println!(
-                            "rt_shm: K3 mailbox IRQ handler registered (irq={})",
-                            rx_irq
+                            "rt_shm: K3 mailbox IRQ handler registered (domain={}, irq={})",
+                            rx_irq.domain.0,
+                            rx_irq.hwirq.0
                         ),
                         Err(e) => ax_println!("rt_shm: failed to register K3 mailbox IRQ: {e:?}"),
                     }
@@ -451,16 +501,60 @@ impl RtShmDevice {
             shm_size
         );
         ax_println!(
-            "rt_shm: ov-channels SharedMemory<{}> valid={} (expected false at boot; becomes true after rt-async inits)",
+            "rt_shm: ov-channels SharedMemory<{}> valid={} (expected false at boot; becomes true \
+             after rt-async inits)",
             DEFAULT_CHANNELS,
             valid
         );
 
-        Self {
+        let dev = Self {
             core: SpinNoIrq::new(core),
             shm_phys_base,
             shm_size,
+            test_mbox,
+        };
+
+        // Boot 时自动执行一次 AP 端 mailbox 自测：软件注入 new_msg 验证
+        // mailbox → APLIC → IMSIC → CPU → handler 全链路贯通（无需 rt-async）。
+        // 结果直接进启动日志，便于真板免传文件快速验证。
+        if dev.test_mbox.is_some() {
+            match dev.test_k3_mailbox_irq() {
+                Ok(n) => ax_println!(
+                    "rt_shm: K3 mailbox selftest OK: IRQ handler fired {n} time(s) \
+                     (mailbox→APLIC→CPU→handler 链路贯通)"
+                ),
+                Err(e) => ax_println!(
+                    "rt_shm: K3 mailbox selftest FAILED: {e:?} \
+                     (中断未触发——检查 APLIC source 217 使能与 IMSIC 配置)"
+                ),
+            }
         }
+        dev
+    }
+
+    /// AP 端纯自测：向本地 user 注入一条 new_msg，轮询等待 IRQ handler 触发。
+    ///
+    /// 验证 mailbox → APLIC → IMSIC → CPU → handler 全链路贯通，无需对端
+    /// （rt-async）参与。返回 handler 触发次数；超时（中断链路断）返回
+    /// [`VfsError::Io`]。
+    ///
+    /// 仅 K3 mailbox 后端可用；其余平台（test_mbox=None）返回
+    /// [`VfsError::Unsupported`]。
+    fn test_k3_mailbox_irq(&self) -> VfsResult<usize> {
+        let Some(mbox) = &self.test_mbox else {
+            return Err(VfsError::Unsupported);
+        };
+        let before = K3_MBOX_IRQ_COUNT.load(Ordering::Acquire);
+        mbox.inject_local_message(CH_FROM_RT_ASYNC.get());
+        // 中断应在微秒量级到达；轮询 1ms 仍无触发则判链路故障。
+        for _ in 0..1000 {
+            let now = K3_MBOX_IRQ_COUNT.load(Ordering::Acquire);
+            if now != before {
+                return Ok(now - before);
+            }
+            core::hint::spin_loop();
+        }
+        Err(VfsError::Io)
     }
 }
 
@@ -482,9 +576,9 @@ impl DeviceOps for RtShmDevice {
                 Ok(0)
             }
             RT_SHM_IOC_AWAIT => {
+                use core::{future::poll_fn, task::Poll};
+
                 use ax_task::future::{block_on, interruptible};
-                use core::future::poll_fn;
-                use core::task::Poll;
                 block_on(interruptible(poll_fn(|cx| {
                     if self.core.lock().has_pending() {
                         return Poll::Ready(Ok(0usize));
@@ -499,6 +593,7 @@ impl DeviceOps for RtShmDevice {
                 })))?
             }
             RT_SHM_IOC_CLR_PENDING => Ok(0),
+            RT_SHM_IOC_TEST_MBOX => self.test_k3_mailbox_irq(),
             _ => Err(VfsError::InvalidInput),
         }
     }
