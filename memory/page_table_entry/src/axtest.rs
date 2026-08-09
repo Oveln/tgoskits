@@ -3,6 +3,8 @@ use axtest::prelude::*;
 
 #[cfg(target_arch = "x86_64")]
 use crate::x86_64::{PTF, X64PTE};
+#[cfg(all(target_arch = "riscv64", feature = "svpbmt"))]
+use crate::riscv::Rv64PTE;
 use crate::{GenericPTE, MappingFlags};
 
 #[axtest]
@@ -17,6 +19,64 @@ fn page_table_entry_mapping_flags_debug_and_bit_rules_hold() {
     ax_assert!(debug.contains("WRITE"));
     ax_assert!(debug.contains("USER"));
     ax_assert_eq!(flags.bits(), 0b1011);
+}
+
+#[cfg(all(target_arch = "riscv64", feature = "svpbmt"))]
+#[axtest]
+fn page_table_entry_riscv_svpbmt_uncached_encodes_pbmt_nc() {
+    // 回归测试：K3 共享内存 mmap 依赖 Svpbmt PBMT 字段编码 UNCACHED。
+    // 未启用 svpbmt feature 时 UNCACHED 不编码（PTE 保持 cacheable），
+    // 跨核写会滞留在本核 cache 不达物理内存。
+    let pte = Rv64PTE::new_page(
+        PhysAddr::from(0x1234_5000),
+        MappingFlags::READ | MappingFlags::WRITE | MappingFlags::UNCACHED,
+        false,
+    );
+    // PBMT 字段 = PTE bits 62:61，NC=01。
+    let pbmt = (pte.bits() >> 61) & 0b11;
+    ax_assert_eq!(pbmt, 0b01, "UNCACHED 应编码为 PBMT=01 (NC)");
+    // 读回路径：PBMT=NC → UNCACHED。
+    let flags = pte.flags();
+    ax_assert!(flags.contains(MappingFlags::UNCACHED));
+    ax_assert!(!flags.contains(MappingFlags::DEVICE));
+    // 物理地址与基础权限不受影响。
+    ax_assert_eq!(pte.paddr(), PhysAddr::from(0x1234_5000));
+    ax_assert!(flags.contains(MappingFlags::READ));
+    ax_assert!(flags.contains(MappingFlags::WRITE));
+}
+
+#[cfg(all(target_arch = "riscv64", feature = "svpbmt"))]
+#[axtest]
+fn page_table_entry_riscv_svpbmt_device_encodes_pbmt_io() {
+    let pte = Rv64PTE::new_page(
+        PhysAddr::from(0x1234_6000),
+        MappingFlags::READ | MappingFlags::WRITE | MappingFlags::DEVICE,
+        false,
+    );
+    // PBMT 字段 = PTE bits 62:61，IO=10。
+    let pbmt = (pte.bits() >> 61) & 0b11;
+    ax_assert_eq!(pbmt, 0b10, "DEVICE 应编码为 PBMT=10 (IO)");
+    // 读回路径：PBMT=IO → DEVICE。
+    let flags = pte.flags();
+    ax_assert!(flags.contains(MappingFlags::DEVICE));
+    ax_assert!(!flags.contains(MappingFlags::UNCACHED));
+    ax_assert_eq!(pte.paddr(), PhysAddr::from(0x1234_6000));
+}
+
+#[cfg(all(target_arch = "riscv64", feature = "svpbmt"))]
+#[axtest]
+fn page_table_entry_riscv_svpbmt_absent_keeps_pbmt_pma() {
+    // 无 UNCACHED/DEVICE 时 PBMT 保持 00（PMA 默认，cacheable）。
+    let pte = Rv64PTE::new_page(
+        PhysAddr::from(0x1234_7000),
+        MappingFlags::READ | MappingFlags::WRITE,
+        false,
+    );
+    let pbmt = (pte.bits() >> 61) & 0b11;
+    ax_assert_eq!(pbmt, 0b00, "普通映射 PBMT 应为 00 (PMA)");
+    let flags = pte.flags();
+    ax_assert!(!flags.contains(MappingFlags::UNCACHED));
+    ax_assert!(!flags.contains(MappingFlags::DEVICE));
 }
 
 #[cfg(target_arch = "x86_64")]
