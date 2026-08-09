@@ -78,7 +78,13 @@ rk3588-pwm = [
     "dep:rdif-pwm",
 ]
 k230-kpu = ["ax-hal/xuantie-c9xx", "dep:axklib", "dep:k230-kpu"]
-k3_com260kit = ["dep:k3_aiUabi", "dep:k3_aiScheduler"]
+k3_com260kit = [
+    "dep:k3_aiUabi",
+    "dep:k3_aiScheduler",
+    # X100 大核支持标准 Svpbmt 扩展；开启后 UNCACHED/DEVICE 映射经 PBMT
+    # 字段（PTE bits 62:61）编码，/dev/rt_shm 的 mmap 才能真正 non-cacheable。
+    "ax-page-table-entry/svpbmt",
+]
 vsock = ["ax-runtime/vsock"]
 dynamic_debug = ["ipi"]
 user_log = []

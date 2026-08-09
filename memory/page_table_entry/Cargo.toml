@@ -13,6 +13,9 @@ license = "Apache-2.0"
 axtest = ["dep:axtest"]
 arm-el2 = []
 xuantie-c9xx = []
+# 标准 RISC-V Svpbmt 扩展（PTE PBMT 字段，bits 62:61）。与 xuantie-c9xx
+# 自定义位互斥（二者占用相同的 PTE 高位），平台二选一启用。
+svpbmt = []
 
 [dependencies]
 axtest = { workspace = true, optional = true }

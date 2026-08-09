@@ -33,23 +33,48 @@ bitflags::bitflags! {
         /// Reference datasheet:
         /// https://github.com/XUANTIE-RV/openc910/blob/main/doc/%E7%8E%84%E9%93%81C910%E7%94%A8%E6%88%B7%E6%89%8B%E5%86%8C_20240627.pdf
         ///
-        #[cfg(feature = "xuantie-c9xx")]
+        #[cfg(all(feature = "xuantie-c9xx", not(feature = "svpbmt")))]
         /// Trustable
         const SEC =   1 << 59;
-        #[cfg(feature = "xuantie-c9xx")]
+        #[cfg(all(feature = "xuantie-c9xx", not(feature = "svpbmt")))]
         /// Shareable
         const  SH =   1 << 60;
-        #[cfg(feature = "xuantie-c9xx")]
+        #[cfg(all(feature = "xuantie-c9xx", not(feature = "svpbmt")))]
         /// Bufferable
         const   B =   1 << 61;
-        #[cfg(feature = "xuantie-c9xx")]
+        #[cfg(all(feature = "xuantie-c9xx", not(feature = "svpbmt")))]
         /// Cacheable
         const   C =   1 << 62;
-        #[cfg(feature = "xuantie-c9xx")]
+        #[cfg(all(feature = "xuantie-c9xx", not(feature = "svpbmt")))]
         /// Strong order (Device)
         const  SO =   1 << 63;
 
+        /// Svpbmt PBMT 字段（bits 62:61）编码。两个常量必须定义进
+        /// `PTEFlags`，否则 `flags()` 的 `from_bits_truncate` 会把 PBMT
+        /// 高位截断丢弃，UNCACHED/DEVICE 无法从 PTE 读回。
+        #[cfg(feature = "svpbmt")]
+        /// PBMT = 01：NC（non-cacheable）
+        const PBMT_NC =   1 << 61;
+        #[cfg(feature = "svpbmt")]
+        /// PBMT = 10：IO（strongly-ordered）
+        const PBMT_IO =   1 << 62;
+
     }
+}
+
+/// Svpbmt PBMT 字段（PTE bits 62:61）的编码值。
+///
+/// 标准 RISC-V 扩展（X100 等核支持）：`00`=PMA 默认（cacheable），
+/// `01`=NC（non-cacheable），`10`=IO（强序设备）。与 xuantie-c9xx 自定义位
+/// 互斥——两者都占用 PTE 高位，同一平台只能启用其一。
+#[cfg(feature = "svpbmt")]
+mod pbmt {
+    pub const PBMT_SHIFT: u64 = 61;
+    pub const PBMT_MASK: u64 = 0b11 << PBMT_SHIFT;
+    /// NC：non-cacheable（共享内存/外设 buffer 用）。
+    pub const NC: u64 = 0b01 << PBMT_SHIFT;
+    /// IO：strongly-ordered（设备寄存器用）。
+    pub const IO: u64 = 0b10 << PBMT_SHIFT;
 }
 
 impl From<PTEFlags> for MappingFlags {
@@ -69,6 +94,16 @@ impl From<PTEFlags> for MappingFlags {
         }
         if f.contains(PTEFlags::U) {
             ret |= Self::USER;
+        }
+        #[cfg(feature = "svpbmt")]
+        {
+            // 读回 Svpbmt PBMT 字段（bits 62:61）：NC → UNCACHED，IO → DEVICE。
+            let pbmt = f.bits() & (pbmt::PBMT_MASK as usize);
+            if pbmt == pbmt::NC as usize {
+                ret |= Self::UNCACHED;
+            } else if pbmt == pbmt::IO as usize {
+                ret |= Self::DEVICE;
+            }
         }
         ret
     }
@@ -115,7 +150,18 @@ impl Rv64PTE {
     /// extended_flags are all the extended flag bits that need to be set
     #[allow(unused)]
     pub fn set_extended_flags(&mut self, mflags: MappingFlags, extended_flags: u64) -> PTEFlags {
-        #[cfg(feature = "xuantie-c9xx")]
+        #[cfg(feature = "svpbmt")]
+        {
+            // 标准 RISC-V Svpbmt：PBMT 字段（bits 62:61）编码内存类型。
+            // UNCACHED → NC（non-cacheable），DEVICE → IO（强序）。
+            // 共享内存 mmap 依赖此路径让 PTE 真正 non-cacheable。
+            if mflags.contains(MappingFlags::DEVICE) {
+                self.0 = (self.0 & !pbmt::PBMT_MASK) | pbmt::IO;
+            } else if mflags.contains(MappingFlags::UNCACHED) {
+                self.0 = (self.0 & !pbmt::PBMT_MASK) | pbmt::NC;
+            }
+        }
+        #[cfg(all(feature = "xuantie-c9xx", not(feature = "svpbmt")))]
         {
             // CPU T-Head XUANTIE-C9xx extended flags:
             if mflags.contains(MappingFlags::DEVICE) {
