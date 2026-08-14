@@ -57,6 +57,9 @@ pub enum Event {
     /// available in the ring buffer.
     PeerNotify,
     /// The interrupt was not from our peer (spurious / other source).
+    ///
+    /// 预留变体：当前 K3 endpoint 无条件返回 `PeerNotify`（NEW_MSG 中断线
+    /// 只由对端 FIFO 写触发）。引入多路中断源或共享中断线的后端时启用。
     Spurious,
 }
 
