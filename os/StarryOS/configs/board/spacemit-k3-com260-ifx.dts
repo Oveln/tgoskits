@@ -9138,15 +9138,16 @@
 			reg = <0x02 0xfe000000 0x00 0x2000000>;
 		};
 
-		rt_shm_ddr@104430000 {
-			// 跨核共享内存（从 Audio SRAM 0xc0800000 搬到 DDR）。
-			// 实测 rcpu1 写 Audio SRAM 的数据 AP 经 phys_to_virt/mmap 均读不到
-			// （疑似 Secure 属性 + IOPMP 过滤，或 dcache 一致性；未深查根因，
-			// 因官方 rpmsg 虽用 rcpu1+SRAM，但 AP 经不同的访问路径）。
-			// DDR 0x104430000 是 AP free DDR 区最低端，两核均能可靠读写
-			// （与官方 rpmsg data buffer @ 0x100c00000 同在 DDR，架构一致）。
+		rt_shm@c0800000 {
+			// 跨核共享内存（RCPU SRAM 0xc0800000）。
+			// 【诊断期 v6】窗口放大到整块 512KB：板上实测 rcpu1 对 SRAM 各段
+			// 写可见性不一致（旧 vring 区 ≥0xc086c000 可写可见，低段写 AP 读
+			// 不到；疑似 IOPMP1=rcpu 上游过滤器只放行顶部子区间，见手册
+			// 15_security.md）。全窗 mmap 供 user-sram-probe L4 网格扫描绘出
+			// rcpu1 实际可写地图；协议窗口（ov-channels footprint 0x18A00，
+			// 取整 0x19000）在扫描定案后再落位，见 amp.toml K3_SHMSIZE。
 			// no-map：reserved-memory 标记，保证 StarryOS 内存分配器不触碰此区。
-			reg = <0x01 0x04430000 0x00 0x11000>;
+			reg = <0x00 0xc0800000 0x00 0x80000>;
 			no-map;
 		};
 	};
@@ -9205,9 +9206,10 @@
 
 	rt-async-amp {
 		compatible = "ov,rt-async-amp";
-		// DDR 0x104430000（与 reserved-memory rt_shm_ddr 对齐——Audio SRAM 上
-		// rcpu1 写入 AP 读不到，搬 DDR 后两核可靠共享；详见 rt_shm_ddr 注释）
-		reg = <0x01 0x04430000 0x00 0x11000>;
+		// 【诊断期 v6】reg 放大到整块 512KB SRAM（与 reserved rt_shm 对齐），
+		// 供 user-sram-probe L4 网格扫描读全图；协议窗口定案后回 0x19000。
+		// 这是 /dev/rt_shm mmap 的真相源（parse_rt_async_from_fdt 读本节点 reg）。
+		reg = <0x00 0xc0800000 0x00 0x80000>;
 		#address-cells = <0x02>;
 		#size-cells = <0x02>;
 
