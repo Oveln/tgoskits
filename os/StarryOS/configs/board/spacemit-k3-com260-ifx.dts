@@ -9138,8 +9138,15 @@
 			reg = <0x02 0xfe000000 0x00 0x2000000>;
 		};
 
-		rt_shm_sram@c0800000 {
-			reg = <0x00 0xc0800000 0x00 0x11000>;
+		rt_shm_ddr@104430000 {
+			// 跨核共享内存（从 Audio SRAM 0xc0800000 搬到 DDR）。
+			// 实测 rcpu1 写 Audio SRAM 的数据 AP 经 phys_to_virt/mmap 均读不到
+			// （疑似 Secure 属性 + IOPMP 过滤，或 dcache 一致性；未深查根因，
+			// 因官方 rpmsg 虽用 rcpu1+SRAM，但 AP 经不同的访问路径）。
+			// DDR 0x104430000 是 AP free DDR 区最低端，两核均能可靠读写
+			// （与官方 rpmsg data buffer @ 0x100c00000 同在 DDR，架构一致）。
+			// no-map：reserved-memory 标记，保证 StarryOS 内存分配器不触碰此区。
+			reg = <0x01 0x04430000 0x00 0x11000>;
 			no-map;
 		};
 	};
@@ -9198,12 +9205,18 @@
 
 	rt-async-amp {
 		compatible = "ov,rt-async-amp";
-		reg = <0x00 0xc0800000 0x00 0x11000>;
+		// DDR 0x104430000（与 reserved-memory rt_shm_ddr 对齐——Audio SRAM 上
+		// rcpu1 写入 AP 读不到，搬 DDR 后两核可靠共享；详见 rt_shm_ddr 注释）
+		reg = <0x01 0x04430000 0x00 0x11000>;
 		#address-cells = <0x02>;
 		#size-cells = <0x02>;
 
 		notifier {
 			compatible = "ov,k3-mailbox-notifier";
+			// 用 mailbox4（0xCAC91000）——实测 rcpu0 DTB（k3_rt240_com260_ifx.dtb）
+			// 中 mailbox3 = status "okay"（esos 正在使用），mailbox4 = status "disabled"
+			// （空闲）。之前误用 mailbox3 导致 esos rproc 活动与本核 ISR 竞争
+			// 同一 FIFO → 中断风暴。mailbox4 在 esos 侧 disabled，独占可用。
 			reg = <0x00 0xcac91000 0x00 0x400>;
 			tx-channel = <0x00>;
 			rx-channel = <0x01>;
