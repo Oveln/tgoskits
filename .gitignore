@@ -72,3 +72,6 @@ loongarch64-axvisor-guest-tests.md
 /logs/offline-monitor/
 /images/linux-qemu/
 offline-monitor-analysis*.html
+
+# ZCode/Omo 会话元数据目录
+.omo
