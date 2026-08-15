@@ -626,6 +626,10 @@ impl PbmtProbe {
 /// 用于区分探针失败的两种形态：「DT 没声明 → 固件/DT 老」与「DT 声明了但
 /// 探针失败 → menvcfg.PBMTE 未置或硅忽略」。fdt-parser 无子节点枚举，
 /// 按 cpu@N 命名惯例探测前 8 个槽位。
+///
+/// 两种 DT 风格都查：旧式 `riscv,isa` 下划线长串（含 svpbmt 子串）与新式
+/// `riscv,isa-extensions` stringlist（厂商 K3 DT 即此风格，riscv,isa 只有
+/// "rv64imafdcvh"——只查前者会假阴性）。
 fn fdt_declares_svpbmt() -> Option<bool> {
     const CPU_PATHS: [&str; 8] = [
         "/cpus/cpu@0",
@@ -639,11 +643,11 @@ fn fdt_declares_svpbmt() -> Option<bool> {
     ];
     let fdt = ax_runtime::hal::dtb::get_fdt()?;
     for path in CPU_PATHS {
-        if let Some(isa) = fdt
-            .find_nodes(path)
-            .next()
-            .and_then(|n| n.find_property("riscv,isa"))
-        {
+        let node = fdt.find_nodes(path).next()?;
+        if let Some(exts) = node.find_property("riscv,isa-extensions") {
+            return Some(exts.str_list().any(|e| e == "svpbmt"));
+        }
+        if let Some(isa) = node.find_property("riscv,isa") {
             return Some(isa.str().contains("svpbmt"));
         }
     }
