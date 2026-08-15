@@ -55,7 +55,7 @@
 //! ```text
 //! rt-async@c0800000 {
 //!     compatible = "ov,rt-async-amp";
-//!     reg = <0x0 0xc0800000 0x0 0x19000>;    // ≥ ov-channels footprint 0x18A00
+//!     reg = <0x0 0xc0800000 0x0 0x19000>;    // ≥ ov-channels footprint 0x18700
 //!     notifier {
 //!         compatible = "ov,k3-mailbox-notifier";
 //!         reg = <0x0 0xcac91000 0x0 0x400>;   // mailbox4（esos 侧 disabled，独占）
@@ -304,6 +304,7 @@ impl IpiSender for ClintIpiSender {
 // 寄存器布局出自 K3 TRM mailbox 章（与 M-mode 侧 chip-k3-rt24/src/mailbox.rs
 // 的定义保持一致，两处改动需同步）。
 const K3_MBOX_MSG_BASE: usize = 0x040;
+const K3_MBOX_MSG_STATUS_BASE: usize = 0x0c0;
 const K3_MBOX_IRQ_BASE: usize = 0x100;
 const K3_MBOX_IRQ_STRIDE: usize = 0x10;
 const K3_MBOX_IRQ_STATUS_OFF: usize = 0x00;
@@ -353,12 +354,42 @@ impl K3MboxMmio {
         self.write(K3_MBOX_MSG_BASE + (channel as usize) * 4, 1);
     }
 
+    /// 应答并清 pending——按 M-mode 侧 `mbox_isr`
+    /// （modules/chip-k3-rt24/src/mailbox.rs，与 esos 驱动同模式）的硬件语义：
+    ///
+    /// * NEW_MSG 是**锁存电平**：只要曾有待读消息就拉高并 latch；
+    /// * CLR 写生效的前提是之前**至少一次 mbox_msg 读**作 acknowledge，且
+    ///   FIFO 仍非空时写 CLR 只临时清 latch、硬件立即重新置位；
+    /// * AP 侧 APLIC **MSI 模式**对电平源只在 setip 0→1 跳变时投一次 MSI，
+    ///   不像 PLIC 会持续重投——若 burst 门铃撞上 CLR 写（FIFO 瞬时非空），
+    ///   CLR 不生效、中断线永久挂高，之后所有门铃全部隐形（板上实锤
+    ///   2026-08-15：count=2 后再无 IRQ，停靠的 AWAIT 永久挂死）。
+    ///
+    /// 故必须外层循环：排空 FIFO（读一次 ack + 按 num_msg 判空）→ RMW 清
+    /// pending → 重读 `RAW & EN`，真正归零才返回；后续门铃才能产生新的
+    /// setip 上升沿。上限防 IRQ 上下文活锁。
     fn ack_and_clear(&self, channel: u8) {
-        let _ = self.read(K3_MBOX_MSG_BASE + (channel as usize) * 4);
-        self.write(
-            k3_irq_reg(self.user_local, K3_MBOX_IRQ_CLR_OFF),
-            k3_new_msg_mask(channel),
-        );
+        let ch = channel as usize;
+        let mask = k3_new_msg_mask(channel);
+        let status = k3_irq_reg(self.user_local, K3_MBOX_IRQ_STATUS_OFF);
+        let clr = k3_irq_reg(self.user_local, K3_MBOX_IRQ_CLR_OFF);
+        let en = k3_irq_reg(self.user_local, K3_MBOX_IRQ_EN_SET_OFF);
+        for _round in 0..32 {
+            if self.read(status) & self.read(en) & mask == 0 {
+                break;
+            }
+            // 排空 FIFO：先读一次 mbox_msg（acknowledge）再按 num_msg 判空，
+            // 对齐 M-mode/esos 的 while(1){readl;check;break} 模式。
+            for _ in 0..64 {
+                let _ = self.read(K3_MBOX_MSG_BASE + ch * 4);
+                if self.read(K3_MBOX_MSG_STATUS_BASE + ch * 4) & 0xF == 0 {
+                    break;
+                }
+            }
+            // 清 pending：RMW 保留其他通道位（esos 同款；CLR 可读）。
+            let cur = self.read(clr);
+            self.write(clr, cur | mask);
+        }
     }
 
     fn enable_rx(&self, channel: u8) {
@@ -785,6 +816,14 @@ impl DeviceOps for RtShmDevice {
                         return Poll::Ready(Ok(0usize));
                     }
                     let mut guard = IPC_WAKER.lock();
+                    // 重查前必须**再作废一次**（锁内，SpinNoIrq 挡住中断）：
+                    // 首查读会把"空"快照取入缓存；若 RP 回包恰在首查与注册
+                    // waker 之间落 SRAM、且其门铃唤醒先于此处拿到锁（waker
+                    // 未注册，wake 为 no-op），锁内重查会命中首查的陈旧行而
+                    // 误判"无数据"→ 注册 → 永久挂死。板上实锤：第 2 轮起 RP
+                    // 暖态回程 µs 级，稳定踩中该窗口（wget 的 eth0 中断流把
+                    // handler 推迟到注册之后，故 wget 后跑全过）。
+                    invalidate_shm_window(lin_vaddr, self.shm_size);
                     if self.core.lock().has_pending() {
                         Poll::Ready(Ok(0usize))
                     } else {
