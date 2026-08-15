@@ -18,24 +18,32 @@
 //! 缓存同步点（见下），偏离该纪律（如两次同步点之间再写共享窗）会触发
 //! 64B 行部分写回覆盖对端数据的经典非一致缓存风险。
 //!
-//! ## 缓存一致性模型（K3/X100 实测结论，2026-08-15）
+//! ## 缓存一致性模型（双模式，boot 期 PBMT 探针自动选择）
 //!
-//! **X100 上 PTE 的 PBMT 属性不生效**（疑似 OpenSBI 未置 `menvcfg.PBMTE`，
-//! 被忽略且不报错）。PMA 按地址判定：mailbox 等 MMIO 天然非缓存（故一直
-//! "正常"），而共享 SRAM 是真 RAM，PMA=cacheable，PTE 写 PBMT=NC 压不住。
-//! 因此本驱动**不信任任何"NC 映射"语义**——内核 ioremap 别名与用户态
-//! mmap 的读写实际都走缓存；唯一可靠的一致性工具是显式 CBO（zicbom，
-//! 经 HAL `dcache_range` 分发）。四个同步点：
+//! 共享 SRAM 的 PMA 为 cacheable（真 RAM），能否用页表属性压成非缓存取决于
+//! **PBMT 是否生效**：X100 硬件声称 RVA23（强制 Svpbmt）、厂商 DT 也声明
+//! svpbmt，但 S/U 模式用 PBMT 需要 M-mode 固件先置 `menvcfg.PBMTE`——
+//! OpenSBI 1.6 仅在传入 DT 声明 svpbmt 且 priv≥1.12 时置位（sbi_hart.c），
+//! 板上固件状态随刷机版本浮动，且被忽略时**不报错**（2026-08-15 板测即踩此，
+//! 彼时只能靠 CBO 兜底）。因此本驱动 boot 期跑一次**功能探针**（写穿透
+//! 判定，见 PbmtProbe）决定运行时模式：
+//!
+//! * **PbmtNc**（探针通过）：ioremap 的 IO 别名与用户态 NC mmap 真实非缓存，
+//!   读写直达 SRAM——NOTIFY/AWAIT/mmap 的逐操作 CBO 同步点全部跳过，时延
+//!   最优（小消息场景比全窗 CBO 扫掠快约一个量级）。
+//! * **Cbo**（探针失败或无法执行）：不信任任何"NC 映射"语义（读写实际都走
+//!   缓存），保留四处显式 CBO 同步点（zicbom，经 HAL `dcache_range` 分发）：
 //!
 //! | 时机 | 操作 | 方向/目的 |
 //! |---|---|---|
-//! | 设备初始化 | invalidate | 丢弃启动链（SPL/U-Boot cacheable 写）遗留脏行，杜绝迟到写回 |
-//! | mmap | invalidate | 清内核早期访问留下的驻留行，用户态首写直达 SRAM |
-//! | NOTIFY（门铃前） | clean+invalidate | for-device：把本核滞留写推到 SRAM 再通知对端 |
-//! | AWAIT（每次就绪检查前 + 返回前） | invalidate / clean+invalidate | for-cpu：读到对端已写入 SRAM 的回包真值 |
+//! | 设备初始化 | invalidate | **两种模式都保留**：丢弃启动链（SPL/U-Boot cacheable 写）遗留脏行，杜绝迟到写回——与 PBMT 无关的启动链卫生 |
+//! | mmap | invalidate | Cbo 模式：清内核早期访问留下的驻留行，用户态首写直达 SRAM |
+//! | NOTIFY（门铃前） | clean+invalidate | Cbo 模式：for-device，把本核滞留写推到 SRAM 再通知对端 |
+//! | AWAIT（每次就绪检查前 + 返回前） | invalidate / clean+invalidate | Cbo 模式：for-cpu，读到对端已写入 SRAM 的回包真值 |
 //!
 //! 兜底：启动期早于初始化作废的写回，由 RP 侧 magic 自愈（幂等 re-init）
-//! 消化。长期课题：修通 PBMTE 后可省逐操作 CBO 开销（纯优化，协议不变）。
+//! 消化。固件侧排查线索：OpenSBI 启动日志的 `Boot HART ISA Extensions` 行
+//! 有无 svpbmt（无 → 固件 DT 老；有而探针失败 → PBMTE 未置或硅忽略）。
 //!
 //! ## ioctl ABI
 //!
@@ -289,7 +297,10 @@ impl ClintIpiSender {
 impl IpiSender for ClintIpiSender {
     #[cfg(target_arch = "riscv64")]
     fn notify_peer(&mut self) {
-        core::sync::atomic::fence(Ordering::Release);
+        // iorw,iorw 全序栅栏（普通+IO 读写）：既覆盖 Cbo 模式的 CBO 后排序，
+        // 也严格保证 PbmtNc 模式下 NC store 先于门铃 MMIO write 对总线可见
+        // （fence rw,rw 对 IO 后继的排序在规范层面不足）。
+        unsafe { core::arch::asm!("fence iorw, iorw", options(nostack, preserves_flags)) };
         unsafe {
             core::ptr::write_volatile(self.msip_ptr, 1);
         }
@@ -436,7 +447,9 @@ impl K3MboxMmio {
             drained += 1;
         }
         if drained > 0 {
-            ax_println!("rt_shm: mailbox rx ch{channel} drained {drained} stale message(s) before enable");
+            ax_println!(
+                "rt_shm: mailbox rx ch{channel} drained {drained} stale message(s) before enable"
+            );
         }
     }
 }
@@ -449,7 +462,13 @@ struct K3MailboxIpiSender {
 
 impl IpiSender for K3MailboxIpiSender {
     fn notify_peer(&mut self) {
-        core::sync::atomic::fence(Ordering::Release);
+        // 同 ClintIpiSender：iorw,iorw 全序栅栏，严格保证 NC/CBO 后的共享窗
+        // 写先于 mailbox 门铃 MMIO write 总线可见（riscv64 专属指令，多架构
+        // 编译门控）。
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            core::arch::asm!("fence iorw, iorw", options(nostack, preserves_flags))
+        };
         self.mbox
             .signal_to_remote(self.tx_channel, self.user_remote);
     }
@@ -535,6 +554,102 @@ fn flush_shm_window(vaddr: usize, size: usize) {
     );
 }
 
+// ── Coherence mode & PBMT probe ────────────────────────────────────────────
+
+/// 共享窗运行时一致性模式（boot 期由 PBMT 探针判定，见模块文档
+/// 「缓存一致性模型」）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CoherenceMode {
+    /// PBMT 生效：IO/NC 映射真实非缓存，读写直达 SRAM，逐操作 CBO
+    /// 同步点全部跳过（小消息场景时延最优）。
+    PbmtNc,
+    /// PBMT 不生效或未知：不信任任何映射属性，保留全部 CBO 同步点。
+    Cbo,
+}
+
+/// PBMT 探针 magic（A=prime 脏行值，B=写穿透判定值，互异且非全 0/1）。
+const PBMT_PROBE_A: u64 = 0xA5A5_5A5A_A5A5_5A5A;
+const PBMT_PROBE_B: u64 = 0x5A5A_A5A5_5A5A_A5A5;
+
+/// PBMT 写穿透探针（boot 期一次性，跨 ioremap 分两段执行）。
+///
+/// 利用 ioremap 前后**同一虚地址**的属性变化（cacheable 线性映射 → IO/PBMT
+/// 重写）构造判定序列：
+///
+/// 1. `prime`（ioremap 前）：经 cacheable 线性映射向 scratch 行写 A——制造
+///    本核驻留脏行；
+/// 2. 调用方执行 `ioremap_raw`（窗口 PTE 重写为 IO 属性，TLB 由映射层刷新）；
+/// 3. `finish`（ioremap 后）：经（名义上的）IO 映射写 B。PBMT 生效 ⇒ B
+///    绕过缓存直达 SRAM，脏行 A 不受影响；PBMT 被固件/硬件忽略 ⇒ 写命中
+///    同一缓存行，B 只是覆盖 A，SRAM 仍是旧值；
+/// 4. 作废 scratch 行后回读：== B ⇒ PBMT 生效；否则被忽略。
+///
+/// scratch 取窗口最后一行：ov-channels footprint（0x18700）之外、双端协议
+/// 均不触碰的空闲区；探针后该行内容为垃圾（若未来窗口布局收缩到 footprint
+/// 贴边需重审此假设）。窗口不足 64B 或尾行未按 CBO 块对齐时返回 None，
+/// 放弃探针、保守走 [`CoherenceMode::Cbo`]。
+struct PbmtProbe {
+    /// scratch 行虚地址（窗口最后一行，64B 对齐）。
+    scratch: usize,
+}
+
+impl PbmtProbe {
+    /// 第一段：ioremap 前在尾行制造 cacheable 脏行。
+    fn prime(lin_vaddr: usize, shm_size: usize) -> Option<Self> {
+        let scratch = lin_vaddr.checked_add(shm_size)? - 64;
+        if scratch & 0x3f != 0 {
+            return None;
+        }
+        // SAFETY: 窗口内已映射的普通内存，对齐的单字 volatile 访问。
+        unsafe { core::ptr::write_volatile(scratch as *mut u64, PBMT_PROBE_A) };
+        Some(Self { scratch })
+    }
+
+    /// 第二段：ioremap 后执行写穿透判定（见类型文档步骤 3-4）。
+    fn finish(self) -> bool {
+        // SAFETY: 同一虚地址，PTE 已被 ioremap 重写为 IO 属性（PBMT=IO），
+        // volatile 单字访问。
+        unsafe { core::ptr::write_volatile(self.scratch as *mut u64, PBMT_PROBE_B) };
+        invalidate_shm_window(self.scratch, 64);
+        // SAFETY: 回读走（名义上的）IO 映射：PBMT 生效时为非缓存读，取
+        // SRAM 真值；被忽略时为缓存读，作废后重取 SRAM 旧值。
+        let readback = unsafe { core::ptr::read_volatile(self.scratch as *const u64) };
+        // 尾行清理（best-effort）：生效路径下 prime 制造的脏行 A 可能仍驻留
+        // （IO 映射上的 CBO 行为依实现而定），clean+invalidate 把可能的滞留写
+        // 推出，杜绝迟到写回；判读在清理前完成，不受影响。
+        flush_shm_window(self.scratch, 64);
+        readback == PBMT_PROBE_B
+    }
+}
+
+/// 诊断辅助：FDT cpu 节点是否声明 svpbmt。只影响启动日志、不参与判定——
+/// 用于区分探针失败的两种形态：「DT 没声明 → 固件/DT 老」与「DT 声明了但
+/// 探针失败 → menvcfg.PBMTE 未置或硅忽略」。fdt-parser 无子节点枚举，
+/// 按 cpu@N 命名惯例探测前 8 个槽位。
+fn fdt_declares_svpbmt() -> Option<bool> {
+    const CPU_PATHS: [&str; 8] = [
+        "/cpus/cpu@0",
+        "/cpus/cpu@1",
+        "/cpus/cpu@2",
+        "/cpus/cpu@3",
+        "/cpus/cpu@4",
+        "/cpus/cpu@5",
+        "/cpus/cpu@6",
+        "/cpus/cpu@7",
+    ];
+    let fdt = ax_runtime::hal::dtb::get_fdt()?;
+    for path in CPU_PATHS {
+        if let Some(isa) = fdt
+            .find_nodes(path)
+            .next()
+            .and_then(|n| n.find_property("riscv,isa"))
+        {
+            return Some(isa.str().contains("svpbmt"));
+        }
+    }
+    None
+}
+
 // ── RtShmDevice ────────────────────────────────────────────────────────────
 
 enum IpiBackend {
@@ -556,8 +671,11 @@ pub struct RtShmDevice {
     shm_phys_base: usize,
     shm_size: usize,
     /// 共享窗的内核线性映射虚地址（固定 PA 的确定值，new() 算一次）。
-    /// 四个缓存同步点（NOTIFY/AWAIT/mmap 及构造期）都经它做 CBO。
+    /// Cbo 模式的缓存同步点（NOTIFY/AWAIT/mmap）都经它做 CBO。
     lin_vaddr: usize,
+    /// 运行时一致性模式（boot 期 PBMT 探针判定）：决定逐操作 CBO 同步点
+    /// 是否执行，见模块文档「缓存一致性模型」。
+    mode: CoherenceMode,
     /// 共享内存的 ioremap NC 别名映射句柄（保持映射存活；访问经其指针进行）。
     _shm_nc: mmio_api::MmioRaw,
     /// K3 mailbox 自测句柄（mmio + DT 配置的 rx_channel）：仅 K3 分支构造时
@@ -589,8 +707,12 @@ impl RtShmDevice {
             ax_runtime::hal::mem::phys_to_virt(PhysAddr::from(shm_phys_base)).as_ptr() as usize;
         // K3：作废启动链（BootROM/SPL/U-Boot）遗留在缓存中的陈旧脏行，
         // 杜绝迟到写回覆盖 rt-async 数据（详见 invalidate_shm_window 注释）。
+        // **两种模式都保留**——这是与 PBMT 无关的启动链卫生。
         invalidate_shm_window(lin_vaddr, shm_size);
         ax_println!("rt_shm: stale boot-chain cache lines over shm window invalidated");
+        // PBMT 探针第一段：ioremap 重写窗口 PTE 前，先在尾行制造 cacheable
+        // 脏行（完整序列见 PbmtProbe 文档）。
+        let pbmt_probe = PbmtProbe::prime(lin_vaddr, shm_size);
         // 内核访问共享内存改走 ioremap 的 non-cacheable 别名（与 mailbox 同款），
         // 不经 cacheable 线性映射：内核读（is_valid/has_pending）永远新鲜，
         // 也不会在缓存里制造新的驻留行——驻留行会把用户态 NC 写"吸收"在
@@ -599,6 +721,25 @@ impl RtShmDevice {
         // 与设备相同（指针全程有效）。
         let shm_nc = unsafe { mmio_api::ioremap_raw(shm_phys_base.into(), shm_size) }
             .expect("rt_shm: failed to ioremap shm window");
+        // PBMT 探针第二段：经 IO 属性映射做写穿透判定，确定运行时一致性
+        // 模式（探针不可执行或判失败时保守走 Cbo）。
+        let mode = match pbmt_probe {
+            Some(probe) => {
+                if probe.finish() {
+                    CoherenceMode::PbmtNc
+                } else {
+                    CoherenceMode::Cbo
+                }
+            }
+            None => CoherenceMode::Cbo,
+        };
+        ax_println!(
+            "rt_shm: PBMT probe: effective={} dt_svpbmt={:?} -> {:?} mode (Cbo=fallback with \
+             per-op sync points)",
+            mode == CoherenceMode::PbmtNc,
+            fdt_declares_svpbmt(),
+            mode
+        );
         let vaddr = shm_nc.as_nonnull_ptr().as_ptr() as usize;
         let shm: &'static SharedMemory<DEFAULT_CHANNELS> = unsafe { SharedMemory::at(vaddr) };
         let access = unsafe { OvChannelsShmAccess::new(shm, CH_FROM_RT_ASYNC) };
@@ -718,6 +859,7 @@ impl RtShmDevice {
             shm_phys_base,
             shm_size,
             lin_vaddr,
+            mode,
             _shm_nc: shm_nc,
             test_mbox,
         };
@@ -732,9 +874,8 @@ impl RtShmDevice {
                      (mailbox→APLIC→CPU→handler 链路贯通)"
                 ),
                 Err(e) => ax_println!(
-                    "rt_shm: K3 mailbox selftest FAILED: {e:?} \
-                     (中断未触发——检查 notifier 中断线使能与 IMSIC 配置，\
-                     注册行上方有实际 domain/irq 号)"
+                    "rt_shm: K3 mailbox selftest FAILED: {e:?} (中断未触发——检查 notifier \
+                     中断线使能与 IMSIC 配置，注册行上方有实际 domain/irq 号)"
                 ),
             }
         }
@@ -771,7 +912,8 @@ impl RtShmDevice {
             }
             let (raw, en) = mbox.debug_irq_raw();
             ax_println!(
-                "rt_shm: mailbox selftest attempt {attempt} 未触发 (IRQSTATUS_RAW={raw:#010x}, IRQENABLE={en:#010x})"
+                "rt_shm: mailbox selftest attempt {attempt} 未触发 (IRQSTATUS_RAW={raw:#010x}, \
+                 IRQENABLE={en:#010x})"
             );
         }
         Err(VfsError::Io)
@@ -792,10 +934,13 @@ impl DeviceOps for RtShmDevice {
     fn ioctl(&self, cmd: u32, _arg: usize) -> VfsResult<usize> {
         match cmd {
             RT_SHM_IOC_NOTIFY => {
-                // 通知前把窗口 clean+invalidate（DMA-to-device 屏障）：把本核
-                // 缓存可能滞留的写推到 SRAM 再打门铃（详见 flush_shm_window
-                // 注释），保证对端看到全部写入。
-                flush_shm_window(self.lin_vaddr, self.shm_size);
+                // Cbo 模式：通知前把窗口 clean+invalidate（DMA-to-device 屏障），
+                // 把本核缓存可能滞留的写推到 SRAM 再打门铃（详见 flush_shm_window
+                // 注释），保证对端看到全部写入。PbmtNc 模式：NC/IO 写本就直达
+                // SRAM，无滞留可推，跳过。
+                if self.mode == CoherenceMode::Cbo {
+                    flush_shm_window(self.lin_vaddr, self.shm_size);
+                }
                 self.core.lock().notify_peer();
                 Ok(0)
             }
@@ -804,14 +949,20 @@ impl DeviceOps for RtShmDevice {
 
                 use ax_task::future::{block_on, interruptible};
                 let lin_vaddr = self.lin_vaddr;
+                let cbo_mode = self.mode == CoherenceMode::Cbo;
                 let _: Result<usize, VfsError> = block_on(interruptible(poll_fn(|cx| {
-                    // X100 上 PBMT 不生效：SRAM 的 PMA 为 cacheable，ioremap
-                    // 的"NC"别名读同样走缓存（板上实锤：RP 回包已落 SRAM，
-                    // IRQ 唤醒后重查 has_pending 仍命中首查取入的陈旧行，
+                    // 以下作废均为 Cbo 模式专属（PbmtNc 模式下 NC/IO 读直达
+                    // SRAM，天然新鲜）。
+                    //
+                    // Cbo 模式背景：SRAM 的 PMA 为 cacheable，PBMT 不生效时
+                    // ioremap 的"NC"别名读同样走缓存（板上实锤：RP 回包已落
+                    // SRAM，IRQ 唤醒后重查 has_pending 仍命中首查取入的陈旧行，
                     // AWAIT 永久挂死，仅 60/120/180s ping 反复空唤醒）。
                     // 每次就绪检查前先作废窗口行，保证读到 SRAM 真值；poll
                     // 仅由 IRQ/伪唤醒驱动，频率低，CBO 开销可接受。
-                    invalidate_shm_window(lin_vaddr, self.shm_size);
+                    if cbo_mode {
+                        invalidate_shm_window(lin_vaddr, self.shm_size);
+                    }
                     if self.core.lock().has_pending() {
                         return Poll::Ready(Ok(0usize));
                     }
@@ -823,7 +974,9 @@ impl DeviceOps for RtShmDevice {
                     // 误判"无数据"→ 注册 → 永久挂死。板上实锤：第 2 轮起 RP
                     // 暖态回程 µs 级，稳定踩中该窗口（wget 的 eth0 中断流把
                     // handler 推迟到注册之后，故 wget 后跑全过）。
-                    invalidate_shm_window(lin_vaddr, self.shm_size);
+                    if cbo_mode {
+                        invalidate_shm_window(lin_vaddr, self.shm_size);
+                    }
                     if self.core.lock().has_pending() {
                         Poll::Ready(Ok(0usize))
                     } else {
@@ -831,15 +984,18 @@ impl DeviceOps for RtShmDevice {
                         Poll::Pending
                     }
                 })))?;
-                // RP→AP 就绪同步点（for-cpu）：has_pending 经内核 NC 别名判定，
-                // 返回即 SRAM 里已有回包。此处 clean+invalidate 窗口——clean
-                // 把用户态滞留的脏行推出（不丢写），invalidate 作废陈旧驻留行
-                // （含 fetch 早于对端写的行），保证随后用户态读 ch1 直接取
-                // SRAM 真值。板上实锤：用户态映射实际 cacheable 时，无此同步
-                // 点回包在 SRAM 存在 5s 仍对用户态不可读（仅 NOTIFY 的 flush
-                // 能让它显形）。协议安全性：本操作前后用户态不写共享窗
+                // Cbo 模式的 RP→AP 就绪同步点（for-cpu）：has_pending 经内核
+                // NC 别名判定，返回即 SRAM 里已有回包。此处 clean+invalidate
+                // 窗口——clean 把用户态滞留的脏行推出（不丢写），invalidate
+                // 作废陈旧驻留行（含 fetch 早于对端写的行），保证随后用户态读
+                // ch1 直接取 SRAM 真值。板上实锤：用户态映射实际 cacheable 时，
+                // 无此同步点回包在 SRAM 存在 5s 仍对用户态不可读（仅 NOTIFY 的
+                // flush 能让它显形）。协议安全性：本操作前后用户态不写共享窗
                 // （send→NOTIFY→AWAIT→recv 纪律），无部分行写回覆盖对端风险。
-                flush_shm_window(lin_vaddr, self.shm_size);
+                // PbmtNc 模式：用户态 NC 读直达 SRAM，跳过。
+                if cbo_mode {
+                    flush_shm_window(lin_vaddr, self.shm_size);
+                }
                 Ok(0)
             }
             RT_SHM_IOC_CLR_PENDING => Ok(0),
@@ -849,10 +1005,14 @@ impl DeviceOps for RtShmDevice {
     }
 
     fn mmap(&self, _offset: u64, _length: u64) -> DeviceMmap {
-        // 用户态映射前再作废一次全窗缓存行：清掉任何驻留副本（内核早期
-        // cacheable 访问或残留），保证随后用户态的 NC 写直达 SRAM 而不是
-        // 被驻留行"吸收"（板上实锤：AP 回读自写成功而 RP 读不到）。
-        invalidate_shm_window(self.lin_vaddr, self.shm_size);
+        // Cbo 模式：用户态映射前再作废一次全窗缓存行：清掉任何驻留副本
+        // （内核早期 cacheable 访问或残留），保证随后用户态的 NC 写直达
+        // SRAM 而不是被驻留行"吸收"（板上实锤：AP 回读自写成功而 RP 读不到）。
+        // PbmtNc 模式：boot 期 invalidate 后窗口再无 cacheable 访问路径，
+        // 无驻留行可清，跳过。
+        if self.mode == CoherenceMode::Cbo {
+            invalidate_shm_window(self.lin_vaddr, self.shm_size);
+        }
         DeviceMmap::Physical(
             PhysAddrRange::from_start_size(PhysAddr::from(self.shm_phys_base), self.shm_size),
             None,
@@ -868,9 +1028,9 @@ impl DeviceOps for RtShmDevice {
     }
 
     fn flags(&self) -> NodeFlags {
-        // 请求非缓存映射（PTE PBMT=NC）。X100 上该属性实测不生效、一致性
-        // 由四个 CBO 同步点保证（见模块文档「缓存一致性模型」），此标志
-        // 仅对属性生效的平台有意义。
+        // 请求非缓存映射（PTE PBMT=NC）。PbmtNc 模式下这是用户态直达 SRAM
+        // 的实际机制；Cbo 模式下该属性不生效（见模块文档「缓存一致性模型」），
+        // 一致性由 CBO 同步点保证，此标志仅对属性生效的平台有意义。
         NodeFlags::NON_CACHEABLE
     }
 }
