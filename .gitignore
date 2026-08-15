@@ -75,3 +75,5 @@ offline-monitor-analysis*.html
 
 # ZCode/Omo 会话元数据目录
 .omo
+# Codegraph 索引目录
+.codegraph
