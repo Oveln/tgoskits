@@ -28,9 +28,12 @@
 //! 彼时只能靠 CBO 兜底）。因此本驱动 boot 期跑一次**功能探针**（写穿透
 //! 判定，见 PbmtProbe）决定运行时模式：
 //!
-//! * **PbmtNc**（探针通过）：ioremap 的 IO 别名与用户态 NC mmap 真实非缓存，
-//!   读写直达 SRAM——NOTIFY/AWAIT/mmap 的逐操作 CBO 同步点全部跳过，时延
-//!   最优（小消息场景比全窗 CBO 扫掠快约一个量级）。
+//! * **PbmtIo**（探针通过）：内核 ioremap 别名与用户态 mmap（PhysicalIo）
+//!   均为 PBMT=IO，真实非缓存、读写直达 SRAM——NOTIFY/AWAIT/mmap 的逐操作
+//!   CBO 同步点全部跳过，时延最优（小消息场景比全窗 CBO 扫掠快约一个
+//!   量级）。用户态映射刻意用 **IO 而非 NC 编码**：X100 实测只兑现 IO——
+//!   PBMT=NC 的用户态写被缓存吸收，RP 门铃后排到 0 条消息（2026-08-16
+//!   板上实锤）。
 //! * **Cbo**（探针失败或无法执行）：不信任任何"NC 映射"语义（读写实际都走
 //!   缓存），保留四处显式 CBO 同步点（zicbom，经 HAL `dcache_range` 分发）：
 //!
@@ -298,7 +301,7 @@ impl IpiSender for ClintIpiSender {
     #[cfg(target_arch = "riscv64")]
     fn notify_peer(&mut self) {
         // iorw,iorw 全序栅栏（普通+IO 读写）：既覆盖 Cbo 模式的 CBO 后排序，
-        // 也严格保证 PbmtNc 模式下 NC store 先于门铃 MMIO write 对总线可见
+        // 也严格保证 PbmtIo 模式下 IO store 先于门铃 MMIO write 对总线可见
         // （fence rw,rw 对 IO 后继的排序在规范层面不足）。
         unsafe { core::arch::asm!("fence iorw, iorw", options(nostack, preserves_flags)) };
         unsafe {
@@ -562,7 +565,7 @@ fn flush_shm_window(vaddr: usize, size: usize) {
 enum CoherenceMode {
     /// PBMT 生效：IO/NC 映射真实非缓存，读写直达 SRAM，逐操作 CBO
     /// 同步点全部跳过（小消息场景时延最优）。
-    PbmtNc,
+    PbmtIo,
     /// PBMT 不生效或未知：不信任任何映射属性，保留全部 CBO 同步点。
     Cbo,
 }
@@ -610,6 +613,14 @@ impl PbmtProbe {
         // SAFETY: 同一虚地址，PTE 已被 ioremap 重写为 IO 属性（PBMT=IO），
         // volatile 单字访问。
         unsafe { core::ptr::write_volatile(self.scratch as *mut u64, PBMT_PROBE_B) };
+        // IO store 排空栅栏：写 B 是 NC/IO store，其后的作废/回读必须显式排
+        // 序——RVWMO 不保证同地址 load 不越过未排空的 device store，无此
+        // 栅栏存在假阴性竞态（板上实锤：同固件首测 false、复测 true，false
+        // 方向不可信；PBMT 不生效路径的判定是确定性 false，故 true 恒可信）。
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            core::arch::asm!("fence iorw, iorw", options(nostack, preserves_flags))
+        };
         invalidate_shm_window(self.scratch, 64);
         // SAFETY: 回读走（名义上的）IO 映射：PBMT 生效时为非缓存读，取
         // SRAM 真值；被忽略时为缓存读，作废后重取 SRAM 旧值。
@@ -662,8 +673,9 @@ fn fdt_declares_svpbmt() -> Option<bool> {
 /// 判固件年代的最短路径。PBMTE 置位逻辑需要 OpenSBI ≥1.2 且 DT 声明
 /// svpbmt：impl_ver < 0x0001_0002 或 Base 扩展不可达（legacy）都意味着
 /// 固件必未置位（刷 SDK 1.6 固件可能激活）；反之若 OpenSBI ≥1.2、DT 也有
-/// svpbmt 而探针仍失败，则指向硅忽略。解码：impl_id 0=OpenSBI，
-/// OpenSBI impl_ver = (major<<16)|minor（0x0001_0006 即 1.6）。
+/// svpbmt 而探针仍失败，则指向硅忽略。解码：impl_id 1=OpenSBI（0=BBL，
+/// 2=KVM，3=RustSBI...），OpenSBI impl_ver = (major<<16)|minor（0x0001_0006
+/// 即 1.6）。
 ///
 /// 仅在引导链含 SBI 固件的平台安全（本驱动两个环境 QEMU/K3 均满足——
 /// QEMU 为 fw_dynamic，K3 为厂商 opensbi 分区链）；纯信息类调用无副作用。
@@ -778,7 +790,7 @@ impl RtShmDevice {
         let mode = match pbmt_probe {
             Some(probe) => {
                 if probe.finish() {
-                    CoherenceMode::PbmtNc
+                    CoherenceMode::PbmtIo
                 } else {
                     CoherenceMode::Cbo
                 }
@@ -788,11 +800,10 @@ impl RtShmDevice {
         let sbi = sbi_versions();
         let (spec_ver, impl_id, impl_ver) = sbi.unwrap_or((0, 0, 0));
         ax_println!(
-            "rt_shm: PBMT probe: effective={} dt_svpbmt={:?} sbi={} (spec={:#x} \
-             impl_id={} impl_ver={:#x}; OpenSBI impl_ver 0x10006=1.6，<0x10002 或 \
-             false=固件无 PBMTE 置位逻辑) -> {:?} mode (Cbo=fallback with per-op \
-             sync points)",
-            mode == CoherenceMode::PbmtNc,
+            "rt_shm: PBMT probe: effective={} dt_svpbmt={:?} sbi={} (spec={:#x} impl_id={} \
+             impl_ver={:#x}; OpenSBI impl_ver 0x10006=1.6，<0x10002 或 false=固件无 PBMTE \
+             置位逻辑) -> {:?} mode (Cbo=fallback with per-op sync points)",
+            mode == CoherenceMode::PbmtIo,
             fdt_declares_svpbmt(),
             sbi.is_some(),
             spec_ver,
@@ -996,7 +1007,7 @@ impl DeviceOps for RtShmDevice {
             RT_SHM_IOC_NOTIFY => {
                 // Cbo 模式：通知前把窗口 clean+invalidate（DMA-to-device 屏障），
                 // 把本核缓存可能滞留的写推到 SRAM 再打门铃（详见 flush_shm_window
-                // 注释），保证对端看到全部写入。PbmtNc 模式：NC/IO 写本就直达
+                // 注释），保证对端看到全部写入。PbmtIo 模式：IO 写本就直达
                 // SRAM，无滞留可推，跳过。
                 if self.mode == CoherenceMode::Cbo {
                     flush_shm_window(self.lin_vaddr, self.shm_size);
@@ -1011,7 +1022,7 @@ impl DeviceOps for RtShmDevice {
                 let lin_vaddr = self.lin_vaddr;
                 let cbo_mode = self.mode == CoherenceMode::Cbo;
                 let _: Result<usize, VfsError> = block_on(interruptible(poll_fn(|cx| {
-                    // 以下作废均为 Cbo 模式专属（PbmtNc 模式下 NC/IO 读直达
+                    // 以下作废均为 Cbo 模式专属（PbmtIo 模式下 IO 读直达
                     // SRAM，天然新鲜）。
                     //
                     // Cbo 模式背景：SRAM 的 PMA 为 cacheable，PBMT 不生效时
@@ -1052,7 +1063,7 @@ impl DeviceOps for RtShmDevice {
                 // 无此同步点回包在 SRAM 存在 5s 仍对用户态不可读（仅 NOTIFY 的
                 // flush 能让它显形）。协议安全性：本操作前后用户态不写共享窗
                 // （send→NOTIFY→AWAIT→recv 纪律），无部分行写回覆盖对端风险。
-                // PbmtNc 模式：用户态 NC 读直达 SRAM，跳过。
+                // PbmtIo 模式：用户态 IO 读直达 SRAM，跳过。
                 if cbo_mode {
                     flush_shm_window(lin_vaddr, self.shm_size);
                 }
@@ -1068,12 +1079,17 @@ impl DeviceOps for RtShmDevice {
         // Cbo 模式：用户态映射前再作废一次全窗缓存行：清掉任何驻留副本
         // （内核早期 cacheable 访问或残留），保证随后用户态的 NC 写直达
         // SRAM 而不是被驻留行"吸收"（板上实锤：AP 回读自写成功而 RP 读不到）。
-        // PbmtNc 模式：boot 期 invalidate 后窗口再无 cacheable 访问路径，
+        // PbmtIo 模式：boot 期 invalidate 后窗口再无 cacheable 访问路径，
         // 无驻留行可清，跳过。
         if self.mode == CoherenceMode::Cbo {
             invalidate_shm_window(self.lin_vaddr, self.shm_size);
         }
-        DeviceMmap::Physical(
+        // 用户态映射用 IO 属性（PBMT=IO）而非 NC：X100 实测只兑现 IO 编码——
+        // PBMT=NC 的用户态写被缓存吸收，RP 门铃后排到 0 条消息（2026-08-16
+        // 板上实锤，PbmtIo 模式首测即挂）；IO 编码经内核别名与探针双路验证。
+        // Cbo 模式下属性被忽略（板上）或平台未启用 svpbmt 特性时，两种编码
+        // 同样退化为普通 cacheable，一致性由 CBO 同步点兜底，行为不变。
+        DeviceMmap::PhysicalIo(
             PhysAddrRange::from_start_size(PhysAddr::from(self.shm_phys_base), self.shm_size),
             None,
         )
@@ -1088,9 +1104,9 @@ impl DeviceOps for RtShmDevice {
     }
 
     fn flags(&self) -> NodeFlags {
-        // 请求非缓存映射（PTE PBMT=NC）。PbmtNc 模式下这是用户态直达 SRAM
-        // 的实际机制；Cbo 模式下该属性不生效（见模块文档「缓存一致性模型」），
-        // 一致性由 CBO 同步点保证，此标志仅对属性生效的平台有意义。
+        // 请求非缓存映射。实际 PTE 属性由 mmap() 返回的 PhysicalIo 决定
+        // （PBMT=IO，X100 唯一兑现的编码）；此标志是 VFS 层语义标注，Cbo
+        // 模式下一致性由 CBO 同步点保证，属性仅对生效的平台有意义。
         NodeFlags::NON_CACHEABLE
     }
 }

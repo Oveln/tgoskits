@@ -235,6 +235,7 @@ pub fn sys_mmap(
                     #[cfg(feature = "rknpu")]
                     Ok(DeviceMmap::PhysicalCached(..)) => false,
                     Ok(DeviceMmap::Physical(..))
+                    | Ok(DeviceMmap::PhysicalIo(..))
                     | Ok(DeviceMmap::PhysicalResolved(..))
                     | Ok(DeviceMmap::PhysicalPages(..))
                     | Ok(DeviceMmap::Cache(_)) => false,
@@ -367,6 +368,25 @@ pub fn sys_mmap(
                             None => Backend::new_linear(start, pa_va_offset, true),
                         }
                     }
+                    Ok(DeviceMmap::PhysicalIo(mut range, retain)) => {
+                        // 设备/强序属性（RISC-V Svpbmt → PBMT=IO）：K3/X100 实测
+                        // 只兑现 IO 编码、忽略 NC（NC 映射写被缓存吸收），共享
+                        // 内存窗的用户态直写必须走 IO。
+                        mapping_flags |= MappingFlags::DEVICE;
+                        range.start += offset;
+                        if range.is_empty() {
+                            return Err(AxError::InvalidInput);
+                        }
+                        length = length.min(range.size().align_down(page_size));
+                        let pa_va_offset =
+                            start.as_usize() as isize - range.start.as_usize() as isize;
+                        match retain {
+                            Some(retain) => {
+                                Backend::new_linear_anchored(start, pa_va_offset, true, retain)
+                            }
+                            None => Backend::new_linear(start, pa_va_offset, true),
+                        }
+                    }
                     #[cfg(feature = "rknpu")]
                     Ok(DeviceMmap::PhysicalCached(mut range, retain)) => {
                         range.start += offset;
@@ -445,6 +465,28 @@ pub fn sys_mmap(
                                     }
                                     DeviceMmap::Physical(range, retain) => {
                                         mapping_flags |= MappingFlags::UNCACHED;
+                                        if range.is_empty() {
+                                            return Err(AxError::InvalidInput);
+                                        }
+                                        length =
+                                            capped_device_map_len(length, range.size(), page_size);
+                                        let pa_va_offset = start.as_usize() as isize
+                                            - range.start.as_usize() as isize;
+                                        match retain {
+                                            Some(retain) => Backend::new_linear_anchored(
+                                                start,
+                                                pa_va_offset,
+                                                true,
+                                                retain,
+                                            ),
+                                            None => Backend::new_linear(start, pa_va_offset, true),
+                                        }
+                                    }
+                                    DeviceMmap::PhysicalIo(range, retain) => {
+                                        // 同上分支 PhysicalIo：设备/强序属性
+                                        // （Svpbmt → PBMT=IO，K3/X100 实测唯一
+                                        // 可靠的 non-cacheable 编码）。
+                                        mapping_flags |= MappingFlags::DEVICE;
                                         if range.is_empty() {
                                             return Err(AxError::InvalidInput);
                                         }

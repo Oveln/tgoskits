@@ -31,6 +31,14 @@ pub enum DeviceMmap {
     /// [`LinearBackend`] so userspace can't observe freed memory if
     /// the device drops the buffer before munmap.
     Physical(PhysAddrRange, Option<Arc<dyn Any + Send + Sync>>),
+    /// Maps to a physical address range with device/strongly-ordered
+    /// attributes (`MappingFlags::DEVICE`，RISC-V Svpbmt 下即 PBMT=IO)。
+    ///
+    /// 为「用户态直写的共享内存窗」准备：个别平台（K3/X100 实测）只兑现
+    /// PBMT=IO 而**忽略 PBMT=NC**——NC 映射的写被缓存吸收、对端不可见；
+    /// IO 编码经内核 ioremap 路径验证可靠。区别于 [`DeviceMmap::Physical`]
+    /// （UNCACHED/NC 属性）。
+    PhysicalIo(PhysAddrRange, Option<Arc<dyn Any + Send + Sync>>),
     /// Maps to cacheable physical RAM.
     ///
     /// This is for DMA buffers that are normal memory and whose driver/runtime
