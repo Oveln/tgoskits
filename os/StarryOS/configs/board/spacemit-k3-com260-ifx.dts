@@ -9139,15 +9139,12 @@
 		};
 
 		rt_shm@c0800000 {
-			// 跨核共享内存（RCPU SRAM 0xc0800000）。
-			// 【诊断期 v6】窗口放大到整块 512KB：板上实测 rcpu1 对 SRAM 各段
-			// 写可见性不一致（旧 vring 区 ≥0xc086c000 可写可见，低段写 AP 读
-			// 不到；疑似 IOPMP1=rcpu 上游过滤器只放行顶部子区间，见手册
-			// 15_security.md）。全窗 mmap 供 user-sram-probe L4 网格扫描绘出
-			// rcpu1 实际可写地图；协议窗口（ov-channels footprint 0x18A00，
-			// 取整 0x19000）在扫描定案后再落位，见 amp.toml K3_SHMSIZE。
+			// 跨核共享内存（RCPU SRAM 0xc0800000，协议窗口 0x19000）。
+			// 大小 ≥ ov-channels SharedMemory::<3> footprint 0x18700（三通道，
+			// 每通道 magic/version + RingBuffer<128> = 0x8200），取整 0x19000；
+			// 与 rt-async-amp 节点 reg、主仓 amp.toml K3_SHMSIZE 对齐，勿缩。
 			// no-map：reserved-memory 标记，保证 StarryOS 内存分配器不触碰此区。
-			reg = <0x00 0xc0800000 0x00 0x80000>;
+			reg = <0x00 0xc0800000 0x00 0x19000>;
 			no-map;
 		};
 	};
@@ -9206,10 +9203,9 @@
 
 	rt-async-amp {
 		compatible = "ov,rt-async-amp";
-		// 【诊断期 v6】reg 放大到整块 512KB SRAM（与 reserved rt_shm 对齐），
-		// 供 user-sram-probe L4 网格扫描读全图；协议窗口定案后回 0x19000。
-		// 这是 /dev/rt_shm mmap 的真相源（parse_rt_async_from_fdt 读本节点 reg）。
-		reg = <0x00 0xc0800000 0x00 0x80000>;
+		// /dev/rt_shm 的真相源（parse_rt_async_from_fdt 读本节点 reg），与上方
+		// reserved rt_shm、主仓 amp.toml K3_SHMBASE/K3_SHMSIZE 对齐。
+		reg = <0x00 0xc0800000 0x00 0x19000>;
 		#address-cells = <0x02>;
 		#size-cells = <0x02>;
 
