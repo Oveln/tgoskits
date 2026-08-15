@@ -654,6 +654,54 @@ fn fdt_declares_svpbmt() -> Option<bool> {
     None
 }
 
+// ── SBI firmware vintage diagnostic ────────────────────────────────────────
+
+/// SBI Base 扩展（EID 0x10）最小 ecall，返回 (spec_ver, impl_id, impl_ver)。
+///
+/// 板上 OpenSBI 可能是静默构建（无 banner 输出），S-mode 下直接问它自己是
+/// 判固件年代的最短路径。PBMTE 置位逻辑需要 OpenSBI ≥1.2 且 DT 声明
+/// svpbmt：impl_ver < 0x0001_0002 或 Base 扩展不可达（legacy）都意味着
+/// 固件必未置位（刷 SDK 1.6 固件可能激活）；反之若 OpenSBI ≥1.2、DT 也有
+/// svpbmt 而探针仍失败，则指向硅忽略。解码：impl_id 0=OpenSBI，
+/// OpenSBI impl_ver = (major<<16)|minor（0x0001_0006 即 1.6）。
+///
+/// 仅在引导链含 SBI 固件的平台安全（本驱动两个环境 QEMU/K3 均满足——
+/// QEMU 为 fw_dynamic，K3 为厂商 opensbi 分区链）；纯信息类调用无副作用。
+#[cfg(target_arch = "riscv64")]
+fn sbi_versions() -> Option<(usize, usize, usize)> {
+    fn sbi_base(fid: usize) -> Option<usize> {
+        let err: i64;
+        let val: usize;
+        // SAFETY: 标准 SBI ecall（a7=EID、a6=FID、返回 a0=err/a1=val），只读
+        // 信息类调用，不改系统状态；a2-a5 可能被 SBI 实现触碰，声明为
+        // lateout 丢弃。
+        unsafe {
+            core::arch::asm!(
+                "ecall",
+                in("a7") 0x10usize,
+                in("a6") fid,
+                lateout("a0") err,
+                lateout("a1") val,
+                lateout("a2") _,
+                lateout("a3") _,
+                lateout("a4") _,
+                lateout("a5") _,
+                options(nostack)
+            );
+        }
+        (err == 0).then_some(val)
+    }
+    let spec_ver = sbi_base(0)?; // GET_SBI_SPEC_VERSION
+    let impl_id = sbi_base(1)?; // GET_SBI_IMPL_ID
+    let impl_ver = sbi_base(2)?; // GET_SBI_IMPL_VERSION
+    Some((spec_ver, impl_id, impl_ver))
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn sbi_versions() -> Option<(usize, usize, usize)> {
+    None
+}
+
 // ── RtShmDevice ────────────────────────────────────────────────────────────
 
 enum IpiBackend {
@@ -737,11 +785,19 @@ impl RtShmDevice {
             }
             None => CoherenceMode::Cbo,
         };
+        let sbi = sbi_versions();
+        let (spec_ver, impl_id, impl_ver) = sbi.unwrap_or((0, 0, 0));
         ax_println!(
-            "rt_shm: PBMT probe: effective={} dt_svpbmt={:?} -> {:?} mode (Cbo=fallback with \
-             per-op sync points)",
+            "rt_shm: PBMT probe: effective={} dt_svpbmt={:?} sbi={} (spec={:#x} \
+             impl_id={} impl_ver={:#x}; OpenSBI impl_ver 0x10006=1.6，<0x10002 或 \
+             false=固件无 PBMTE 置位逻辑) -> {:?} mode (Cbo=fallback with per-op \
+             sync points)",
             mode == CoherenceMode::PbmtNc,
             fdt_declares_svpbmt(),
+            sbi.is_some(),
+            spec_ver,
+            impl_id,
+            impl_ver,
             mode
         );
         let vaddr = shm_nc.as_nonnull_ptr().as_ptr() as usize;
