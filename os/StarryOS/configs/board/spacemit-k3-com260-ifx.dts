@@ -9142,7 +9142,7 @@
 			// 跨核共享内存（RCPU SRAM 0xc0800000，协议窗口 0x19000）。
 			// 大小 ≥ ov-channels SharedMemory::<3> footprint 0x18700（三通道，
 			// 每通道 magic/version + RingBuffer<128> = 0x8200），取整 0x19000；
-			// 与 rt-async-amp 节点 reg、主仓 amp.toml K3_SHMSIZE 对齐，勿缩。
+			// 与 rt-async-amp 节点 reg、主仓 its/rt-async-k3.dts 对齐，勿缩。
 			// no-map：reserved-memory 标记，保证 StarryOS 内存分配器不触碰此区。
 			reg = <0x00 0xc0800000 0x00 0x19000>;
 			no-map;
@@ -9204,7 +9204,7 @@
 	rt-async-amp {
 		compatible = "ov,rt-async-amp";
 		// /dev/rt_shm 的真相源（parse_rt_async_from_fdt 读本节点 reg），与上方
-		// reserved rt_shm、主仓 amp.toml K3_SHMBASE/K3_SHMSIZE 对齐。
+		// reserved rt_shm、主仓 its/rt-async-k3.dts 对齐。
 		reg = <0x00 0xc0800000 0x00 0x19000>;
 		#address-cells = <0x02>;
 		#size-cells = <0x02>;
