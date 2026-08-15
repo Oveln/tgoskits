@@ -25,8 +25,9 @@
 //! svpbmt，但 S/U 模式用 PBMT 需要 M-mode 固件先置 `menvcfg.PBMTE`——
 //! OpenSBI 1.6 仅在传入 DT 声明 svpbmt 且 priv≥1.12 时置位（sbi_hart.c），
 //! 板上固件状态随刷机版本浮动，且被忽略时**不报错**（2026-08-15 板测即踩此，
-//! 彼时只能靠 CBO 兜底）。因此本驱动 boot 期跑一次**功能探针**（写穿透
-//! 判定，见 PbmtProbe）决定运行时模式：
+//! 彼时只能靠 CBO 兜底）。因此本驱动 boot 期跑一次**时延探针**（读时延
+//! 判定，见 probe_pbmt_latency——单别名下功能判定不可行，原因见其文档）
+//! 决定运行时模式：
 //!
 //! * **PbmtIo**（探针通过）：内核 ioremap 别名与用户态 mmap（PhysicalIo）
 //!   均为 PBMT=IO，真实非缓存、读写直达 SRAM——NOTIFY/AWAIT/mmap 的逐操作
@@ -570,67 +571,71 @@ enum CoherenceMode {
     Cbo,
 }
 
-/// PBMT 探针 magic（A=prime 脏行值，B=写穿透判定值，互异且非全 0/1）。
-const PBMT_PROBE_A: u64 = 0xA5A5_5A5A_A5A5_5A5A;
-const PBMT_PROBE_B: u64 = 0x5A5A_A5A5_5A5A_A5A5;
+/// 时延探针对照行：普通内核 BSS（cacheable 线性映射），64B 对齐独占行。
+#[repr(align(64))]
+struct ProbeControlLine([u64; 8]);
+static PROBE_CONTROL: ProbeControlLine = ProbeControlLine([0; 8]);
 
-/// PBMT 写穿透探针（boot 期一次性，跨 ioremap 分两段执行）。
-///
-/// 利用 ioremap 前后**同一虚地址**的属性变化（cacheable 线性映射 → IO/PBMT
-/// 重写）构造判定序列：
-///
-/// 1. `prime`（ioremap 前）：经 cacheable 线性映射向 scratch 行写 A——制造
-///    本核驻留脏行；
-/// 2. 调用方执行 `ioremap_raw`（窗口 PTE 重写为 IO 属性，TLB 由映射层刷新）；
-/// 3. `finish`（ioremap 后）：经（名义上的）IO 映射写 B。PBMT 生效 ⇒ B
-///    绕过缓存直达 SRAM，脏行 A 不受影响；PBMT 被固件/硬件忽略 ⇒ 写命中
-///    同一缓存行，B 只是覆盖 A，SRAM 仍是旧值；
-/// 4. 作废 scratch 行后回读：== B ⇒ PBMT 生效；否则被忽略。
-///
-/// scratch 取窗口最后一行：ov-channels footprint（0x18700）之外、双端协议
-/// 均不触碰的空闲区；探针后该行内容为垃圾（若未来窗口布局收缩到 footprint
-/// 贴边需重审此假设）。窗口不足 64B 或尾行未按 CBO 块对齐时返回 None，
-/// 放弃探针、保守走 [`CoherenceMode::Cbo`]。
-struct PbmtProbe {
-    /// scratch 行虚地址（窗口最后一行，64B 对齐）。
-    scratch: usize,
+/// 读 cycle 计数器（S-mode 可读——OpenSBI 置 mcounteren 全 1）。
+#[cfg(target_arch = "riscv64")]
+fn read_cycle() -> u64 {
+    let c: u64;
+    // SAFETY: 纯只读 CSR 指令，无副作用。
+    unsafe { core::arch::asm!("rdcycle {0}", out(reg) c, options(nostack, preserves_flags)) };
+    c
 }
 
-impl PbmtProbe {
-    /// 第一段：ioremap 前在尾行制造 cacheable 脏行。
-    fn prime(lin_vaddr: usize, shm_size: usize) -> Option<Self> {
-        let scratch = lin_vaddr.checked_add(shm_size)? - 64;
-        if scratch & 0x3f != 0 {
-            return None;
-        }
-        // SAFETY: 窗口内已映射的普通内存，对齐的单字 volatile 访问。
-        unsafe { core::ptr::write_volatile(scratch as *mut u64, PBMT_PROBE_A) };
-        Some(Self { scratch })
+/// PBMT 时延探针（boot 期一次性，**ioremap 之后**调用）。
+///
+/// 为什么不能用写穿透功能探针：riscv 上 ioremap 在线性虚地址**原地重写**
+/// PTE，窗口没有第二个 cacheable 别名；判别所需的 CBO（作废/回写）经 IO
+/// 属性虚地址发出时行为是实现定义的（可能 no-op）——单别名下对「IO 写
+/// 是否直达 SRAM」不存在确定性功能判定（2026-08-16 板上三轮探针结果互相
+/// 矛盾即此故，旧探针已废弃）。
+///
+/// 改测**读时延**：经（名义上的）IO 映射反复读 scratch 行 vs 经 cacheable
+/// 线性映射读普通内核 BSS 对照行。PBMT 生效 ⇒ IO 读绕过 L1 直达 SRAM/
+/// 互连（单次几十~上百周期），比值 ≥3；被忽略 ⇒ 两者同为 L1 命中，比值
+/// ≈1。测量在 SpinNoIrq 关中断下进行（IRQ 抖动会推高 scratch 计数造成
+/// 假阳性 PbmtIo——那会让 CBO 被跳过、IPC 断流，必须杜绝）。
+///
+/// QEMU TCG 无缓存模型，两路同速 → 判 Cbo（与 PbmtIo 行为等价，CBO 均为
+/// no-op）。scratch 取窗口最后一行（footprint 外），不可用时返回 None。
+#[cfg(target_arch = "riscv64")]
+fn probe_pbmt_latency(lin_vaddr: usize, shm_size: usize) -> Option<(bool, u64, u64)> {
+    let scratch = lin_vaddr.checked_add(shm_size)? - 64;
+    if scratch & 0x3f != 0 {
+        return None;
     }
+    let control = PROBE_CONTROL.0.as_ptr() as usize;
+    static PROBE_LOCK: SpinNoIrq<()> = SpinNoIrq::new(());
+    let _guard = PROBE_LOCK.lock();
+    // xor 累加 + volatile 读防优化；先预热对照行确保驻留 L1。
+    let mut acc = 0u64;
+    for _ in 0..16 {
+        acc ^= unsafe { core::ptr::read_volatile(control as *const u64) };
+    }
+    let t0 = read_cycle();
+    for _ in 0..256 {
+        acc ^= unsafe { core::ptr::read_volatile(scratch as *const u64) };
+    }
+    let dt_scratch = read_cycle() - t0;
+    let t1 = read_cycle();
+    for _ in 0..256 {
+        acc ^= unsafe { core::ptr::read_volatile(control as *const u64) };
+    }
+    let dt_control = read_cycle() - t1;
+    core::hint::black_box(acc);
+    Some((
+        dt_scratch >= dt_control.saturating_mul(3),
+        dt_scratch,
+        dt_control,
+    ))
+}
 
-    /// 第二段：ioremap 后执行写穿透判定（见类型文档步骤 3-4）。
-    fn finish(self) -> bool {
-        // SAFETY: 同一虚地址，PTE 已被 ioremap 重写为 IO 属性（PBMT=IO），
-        // volatile 单字访问。
-        unsafe { core::ptr::write_volatile(self.scratch as *mut u64, PBMT_PROBE_B) };
-        // IO store 排空栅栏：写 B 是 NC/IO store，其后的作废/回读必须显式排
-        // 序——RVWMO 不保证同地址 load 不越过未排空的 device store，无此
-        // 栅栏存在假阴性竞态（板上实锤：同固件首测 false、复测 true，false
-        // 方向不可信；PBMT 不生效路径的判定是确定性 false，故 true 恒可信）。
-        #[cfg(target_arch = "riscv64")]
-        unsafe {
-            core::arch::asm!("fence iorw, iorw", options(nostack, preserves_flags))
-        };
-        invalidate_shm_window(self.scratch, 64);
-        // SAFETY: 回读走（名义上的）IO 映射：PBMT 生效时为非缓存读，取
-        // SRAM 真值；被忽略时为缓存读，作废后重取 SRAM 旧值。
-        let readback = unsafe { core::ptr::read_volatile(self.scratch as *const u64) };
-        // 尾行清理（best-effort）：生效路径下 prime 制造的脏行 A 可能仍驻留
-        // （IO 映射上的 CBO 行为依实现而定），clean+invalidate 把可能的滞留写
-        // 推出，杜绝迟到写回；判读在清理前完成，不受影响。
-        flush_shm_window(self.scratch, 64);
-        readback == PBMT_PROBE_B
-    }
+#[cfg(not(target_arch = "riscv64"))]
+fn probe_pbmt_latency(_lin_vaddr: usize, _shm_size: usize) -> Option<(bool, u64, u64)> {
+    None
 }
 
 /// 诊断辅助：FDT cpu 节点是否声明 svpbmt。只影响启动日志、不参与判定——
@@ -774,9 +779,6 @@ impl RtShmDevice {
         // **两种模式都保留**——这是与 PBMT 无关的启动链卫生。
         invalidate_shm_window(lin_vaddr, shm_size);
         ax_println!("rt_shm: stale boot-chain cache lines over shm window invalidated");
-        // PBMT 探针第一段：ioremap 重写窗口 PTE 前，先在尾行制造 cacheable
-        // 脏行（完整序列见 PbmtProbe 文档）。
-        let pbmt_probe = PbmtProbe::prime(lin_vaddr, shm_size);
         // 内核访问共享内存改走 ioremap 的 non-cacheable 别名（与 mailbox 同款），
         // 不经 cacheable 线性映射：内核读（is_valid/has_pending）永远新鲜，
         // 也不会在缓存里制造新的驻留行——驻留行会把用户态 NC 写"吸收"在
@@ -785,25 +787,25 @@ impl RtShmDevice {
         // 与设备相同（指针全程有效）。
         let shm_nc = unsafe { mmio_api::ioremap_raw(shm_phys_base.into(), shm_size) }
             .expect("rt_shm: failed to ioremap shm window");
-        // PBMT 探针第二段：经 IO 属性映射做写穿透判定，确定运行时一致性
-        // 模式（探针不可执行或判失败时保守走 Cbo）。
-        let mode = match pbmt_probe {
-            Some(probe) => {
-                if probe.finish() {
-                    CoherenceMode::PbmtIo
-                } else {
-                    CoherenceMode::Cbo
-                }
-            }
-            None => CoherenceMode::Cbo,
+        // PBMT 时延探针（ioremap 后，IO 属性已就位）：读时延判定映射属性
+        // 是否真实生效，确定运行时一致性模式（探针不可执行或判失败时保守
+        // 走 Cbo）。
+        let (pbmt_ok, dt_scratch, dt_control) = match probe_pbmt_latency(lin_vaddr, shm_size) {
+            Some(r) => r,
+            None => (false, 0, 0),
+        };
+        let mode = if pbmt_ok {
+            CoherenceMode::PbmtIo
+        } else {
+            CoherenceMode::Cbo
         };
         let sbi = sbi_versions();
         let (spec_ver, impl_id, impl_ver) = sbi.unwrap_or((0, 0, 0));
         ax_println!(
-            "rt_shm: PBMT probe: effective={} dt_svpbmt={:?} sbi={} (spec={:#x} impl_id={} \
-             impl_ver={:#x}; OpenSBI impl_ver 0x10006=1.6，<0x10002 或 false=固件无 PBMTE \
-             置位逻辑) -> {:?} mode (Cbo=fallback with per-op sync points)",
-            mode == CoherenceMode::PbmtIo,
+            "rt_shm: PBMT probe: effective={} latency(scratch={dt_scratch} control={dt_control}) \
+             dt_svpbmt={:?} sbi={} (spec={:#x} impl_id={} impl_ver={:#x}; OpenSBI: impl_id=1 \
+             0x10006=1.6) -> {:?} mode (Cbo=fallback with per-op sync points)",
+            pbmt_ok,
             fdt_declares_svpbmt(),
             sbi.is_some(),
             spec_ver,
