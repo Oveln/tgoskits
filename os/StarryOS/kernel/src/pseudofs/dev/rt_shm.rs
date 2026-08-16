@@ -21,22 +21,23 @@
 //! ## 缓存一致性模型（双模式，boot 期 PBMT 探针自动选择）
 //!
 //! 共享 SRAM 的 PMA 为 cacheable（真 RAM），能否用页表属性压成非缓存取决于
-//! **PBMT 是否生效**：X100 硬件声称 RVA23（强制 Svpbmt）、厂商 DT 也声明
-//! svpbmt，但 S/U 模式用 PBMT 需要 M-mode 固件先置 `menvcfg.PBMTE`——
-//! OpenSBI 1.6 仅在传入 DT 声明 svpbmt 且 priv≥1.12 时置位（sbi_hart.c），
-//! 板上固件状态随刷机版本浮动，且被忽略时**不报错**（2026-08-15 板测即踩此，
-//! 彼时只能靠 CBO 兜底）。因此本驱动 boot 期跑一次**时延探针**（读时延
-//! 判定，见 probe_pbmt_latency——单别名下功能判定不可行，原因见其文档）
-//! 决定运行时模式：
+//! **PBMT 是否生效**。板上终局结论（2026-08-16，OpenSBI banner + 时延探针
+//! 双重实锤）：板上 OpenSBI 1.6 已检测到 svpbmt、priv v1.12——按其
+//! sbi_hart.c 逻辑 `menvcfg.PBMTE` 必已置位，而 IO 属性映射的读仍为 L1
+//! 命中时延 ⇒ **X100 硅忽略 PBMT**（宣称 RVA23/Svpbmt 但不兑现；厂商
+//! Linux 全 soc 标 `dma-noncoherent` 走 Zicbom CMO 即为此）。因此本板
+//! 上 Cbo 是唯一可达模式；时延探针（读时延判定，见 probe_pbmt_latency）
+//! 保留作守卫——未来换芯片/固件修通时同一镜像自动升级到 PbmtIo，无需
+//! 重新编译：
 //!
 //! * **PbmtIo**（探针通过）：内核 ioremap 别名与用户态 mmap（PhysicalIo）
 //!   均为 PBMT=IO，真实非缓存、读写直达 SRAM——NOTIFY/AWAIT/mmap 的逐操作
 //!   CBO 同步点全部跳过，时延最优（小消息场景比全窗 CBO 扫掠快约一个
-//!   量级）。用户态映射刻意用 **IO 而非 NC 编码**：X100 实测只兑现 IO——
-//!   PBMT=NC 的用户态写被缓存吸收，RP 门铃后排到 0 条消息（2026-08-16
-//!   板上实锤）。
-//! * **Cbo**（探针失败或无法执行）：不信任任何"NC 映射"语义（读写实际都走
-//!   缓存），保留四处显式 CBO 同步点（zicbom，经 HAL `dcache_range` 分发）：
+//!   量级）。用户态映射用 **IO 而非 NC 编码**：IO 是更严格的属性（强序、
+//!   不合并），且 NC 编码在本系列核上从未得到过正面验证。
+//! * **Cbo**（探针失败或无法执行——含本板 X100）：不信任任何"NC 映射"
+//!   语义（读写实际都走缓存），保留四处显式 CBO 同步点（zicbom，经 HAL
+//!   `dcache_range` 分发）：
 //!
 //! | 时机 | 操作 | 方向/目的 |
 //! |---|---|---|
