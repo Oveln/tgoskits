@@ -14,6 +14,32 @@ use crate::irq_routing::{
 
 pub struct Plat;
 
+/// 放行 U 态 Zicbom 缓存维护指令（cbo.clean/flush/inval），逐 hart 一次性配置。
+///
+/// senvcfg（Senvcfg 扩展）按 U/VU 模式门控 CBO 指令：未置位时 U 态执行
+/// 即 illegal instruction。位域（RISC-V 特权规范，与 Linux `ENVCFG_*` 同值）：
+/// * CBCFE（bit 6）：放行 cbo.clean / cbo.flush；
+/// * CBIE（bits[5:4]）= 01：cbo.inval 按 flush 语义执行（写回脏行再作废），
+///   杜绝 U 态误用 inval 丢弃脏写——本仓用户态缓存助手（ov-rpc `user-cbo`）
+///   依赖该安全性把 refresh 实现为 inval。
+///
+/// 由 `zicbom` feature 门控：board TOML 只为确有 Zicbom 的板（K3/X100）
+/// 开启，QEMU 等平台不编译本代码（无 Senvcfg CSR 的核上 csrs 会陷入）。
+/// X100 S 态已实测执行 cbo（rt_shm 缓存同步点），envcfg 实现随 Zicbom 提供。
+#[cfg(feature = "zicbom")]
+fn enable_user_cbo(cpu_idx: usize) {
+    const SENVCFG_CBCFE: usize = 1 << 6;
+    const SENVCFG_CBIE_FLUSH_SEMANTICS: usize = 1 << 4;
+    unsafe {
+        core::arch::asm!(
+            "csrs senvcfg, {bits}",
+            bits = in(reg) SENVCFG_CBCFE | SENVCFG_CBIE_FLUSH_SEMANTICS,
+            options(nostack, preserves_flags)
+        );
+    }
+    log::info!("somehal: user-mode CBO enabled on cpu{cpu_idx} (senvcfg CBCFE|CBIE=flush)");
+}
+
 fn plic_irq_id_from_claimed_source(source: usize) -> Result<IrqId, IrqError> {
     let domain = crate::irq::domain_by_kind_fast(crate::irq::IrqDomainKind::RiscvPlic)
         .ok_or(IrqError::Unsupported)?;
@@ -128,6 +154,10 @@ impl PlatOp for Plat {
     fn secondary_init() {}
 
     fn init_boot_irq_cpu(cpu_idx: usize, role: crate::irq::CpuBootRole) {
+        // 每个 hart 恰好经过本函数一次（主核经 init_boot_irqs、副核经
+        // init_secondary_boot_irqs），是逐 hart CSR 配置的单点。
+        #[cfg(feature = "zicbom")]
+        enable_user_cbo(cpu_idx);
         match role {
             crate::irq::CpuBootRole::Primary => {}
             crate::irq::CpuBootRole::Secondary => {

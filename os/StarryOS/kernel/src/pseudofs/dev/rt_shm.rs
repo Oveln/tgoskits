@@ -45,6 +45,14 @@
 //!   不会假返回；返回前 clean+invalidate，保证随后用户态读为 SRAM 真值。
 //! * `RT_SHM_IOC_CLR_PENDING`：兼容占位（就绪状态由环索引推导，无需清除）。
 //! * `RT_SHM_IOC_TEST_MBOX`：软件注入 new_msg 自测中断全链路（K3 专用）。
+//! * `RT_SHM_IOC_FLUSH`：仅整窗 clean+invalidate，不发门铃（BUSY 跳过门铃
+//!   时的写发布点）。
+//!
+//! NOTIFY/AWAIT 的 arg 位 `ARG_USER_CBO`（=1，与用户态 ABI 头 rtshm-abi
+//! 同值）：调用方已启用 U 态 Zicbom 按行缓存维护（前置条件为 somehal
+//! `enable_user_cbo` 置 senvcfg），精确发布/刷新自己触碰的行——NOTIFY
+//! 跳过门铃前整窗 flush（仅补一道 fence），AWAIT 跳过返回前整窗 flush、
+//! 就绪检查作废缩至 ch1 magic+索引两行。arg=0 保持整窗语义不变。
 //!
 //! ## 设备树驱动配置
 //!
@@ -67,7 +75,7 @@
 //! ```
 //!
 //! **mailbox 硬件约束**：写 `mbox_msg[ch]` 会同时置位**双方 user** 的 ch
-//! NEW_MSG 位（见 M-mode 侧 `chip-k3-rt24/src/mailbox.rs` 同款说明）——若
+//! NEW_MSG 位（对端 M-mode 固件的 mailbox 驱动有同款说明）——若
 //! tx 与 rx 配成同一通道，本端发门铃会自激触发自己的中断线，故收发**必须**
 //! 分通道（上述 0/1 配置即为此约定，解析默认值同）。
 //!
@@ -76,19 +84,20 @@
 //!
 //! ## 日志策略
 //!
-//! 一次性启动信息（初始化/中断注册/自测）、有界诊断（IRQ 计数前 5 次）、
-//! 罕见事件（注册前排空残留门铃 `drained N stale message(s)`）与失败路径
-//! 打印；高频路径（NOTIFY/AWAIT/每次缓存维护）静默。
+//! 一次性启动信息（初始化/中断注册/自测）、罕见事件（注册前排空残留门铃
+//! `drained N stale message(s)`）与失败路径打印；高频路径（NOTIFY/AWAIT/
+//! 每次缓存维护/IRQ handler）静默，运行诊断经 ioctl 读出（RD_KTS）。
 //!
 //! ## 验证状态
 //!
-//! 2026-08-15 真板（K3 RT24）三轮 RPC 全绿：通知回显 + ADD 请求/响应断言
-//! （中断驱动，`user-test-ipc`）。
+//! K3 真板（RT24 + X100）多轮 RPC 回归全绿：通知回显 + ADD 请求/响应断言
+//! （中断驱动，用户态回环自测程序）。
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use ax_kspin::SpinNoIrq;
 use ax_memory_addr::{PhysAddr, PhysAddrRange};
+use ax_runtime::hal::time::monotonic_time_nanos;
 use axfs_ng_vfs::{DeviceId, NodeFlags, VfsError, VfsResult};
 use axpoll::{IoEvents, Pollable};
 use rt_shm::{
@@ -106,6 +115,20 @@ pub const RT_SHM_IOC_CLR_PENDING: u32 = 0x7350_03;
 /// AP 端纯自测：软件注入一条 mailbox new_msg，验证中断全链路
 /// （mailbox → APLIC → IMSIC → CPU → handler），无需对端参与。
 pub const RT_SHM_IOC_TEST_MBOX: u32 = 0x7350_04;
+/// 仅 flush 共享窗（clean+invalidate），不发门铃。跳过 NOTIFY 门铃的
+/// 发送方（对端 BUSY 自旋中，可省一次 IPI）用它发布缓存滞留的写（请求 /
+/// 已消费的 read 索引）到共享内存——NOTIFY 尾部的 flush 是用户态
+/// cacheable 映射下唯一的写发布点，跳过门铃时必须补纯 flush，否则请求
+/// 对对端不可见、产生幻影 pending 空唤醒循环（真板实测确认）。
+/// ioctl 号与用户态 ABI 头（rtshm-abi）保持同值。
+pub const RT_SHM_IOC_FLUSH: u32 = 0x7350_05;
+/// 投递诊断读数：返回两个内核单调时钟戳（ns）——`[0]` 上次 NOTIFY 门铃
+/// MMIO 写前一瞬（`LAST_PRE_DOORBELL_NS`），`[1]` 上次对端门铃 IRQ
+/// handler 入口（`LAST_IRQ_ENTRY_NS`）。arg = 用户态 `*mut u64` 数组
+/// （2 项）。与对端固件回传的自有时间戳交叉，可分解门铃去程/回程的
+/// 投递耗时（两核时钟 epoch 不同，需差值恒等式消常数）。
+/// ioctl 号与用户态 ABI 头（rtshm-abi）保持同值。
+pub const RT_SHM_IOC_RD_KTS: u32 = 0x7350_06;
 
 /// 伪字符设备号（major=10 = misc，minor=200 本仓自选，注册处防碰撞）。
 pub const RT_SHM_DEVICE_ID: DeviceId = DeviceId::new(10, 200);
@@ -301,8 +324,8 @@ impl IpiSender for ClintIpiSender {
 
 // ── StarryOS Glue: K3 Mailbox ──────────────────────────────────────────────
 
-// 寄存器布局出自 K3 TRM mailbox 章（与 M-mode 侧 chip-k3-rt24/src/mailbox.rs
-// 的定义保持一致，两处改动需同步）。
+// 寄存器布局出自 K3 TRM mailbox 章（对端 M-mode 固件的 mailbox 驱动持有
+// 同一份定义，两处改动需同步）。
 const K3_MBOX_MSG_BASE: usize = 0x040;
 const K3_MBOX_MSG_STATUS_BASE: usize = 0x0c0;
 const K3_MBOX_IRQ_BASE: usize = 0x100;
@@ -354,8 +377,8 @@ impl K3MboxMmio {
         self.write(K3_MBOX_MSG_BASE + (channel as usize) * 4, 1);
     }
 
-    /// 应答并清 pending——按 M-mode 侧 `mbox_isr`
-    /// （modules/chip-k3-rt24/src/mailbox.rs，与 esos 驱动同模式）的硬件语义：
+    /// 应答并清 pending——按对端 M-mode 固件 `mbox_isr`（与平台 BSP 的
+    /// eso 驱动同模式）的硬件语义：
     ///
     /// * NEW_MSG 是**锁存电平**：只要曾有待读消息就拉高并 latch；
     /// * CLR 写生效的前提是之前**至少一次 mbox_msg 读**作 acknowledge，且
@@ -450,6 +473,9 @@ struct K3MailboxIpiSender {
 impl IpiSender for K3MailboxIpiSender {
     fn notify_peer(&mut self) {
         core::sync::atomic::fence(Ordering::Release);
+        // 投递诊断戳：门铃 MMIO 写前一瞬（见 LAST_PRE_DOORBELL_NS 文档）。
+        // 须紧贴 MMIO 写，否则含内核尾段噪声。
+        LAST_PRE_DOORBELL_NS.store(monotonic_time_nanos(), Ordering::Relaxed);
         self.mbox
             .signal_to_remote(self.tx_channel, self.user_remote);
     }
@@ -478,6 +504,13 @@ static IPC_WAKER: SpinNoIrq<Option<core::task::Waker>> = SpinNoIrq::new(None);
 /// K3 mailbox new_msg 中断触发次数（自测用：ioctl TEST_MBOX 轮询此计数确认
 /// mailbox → APLIC → CPU → handler 全链路贯通）。
 static K3_MBOX_IRQ_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// 投递诊断戳：上次 NOTIFY 门铃 MMIO 写前一瞬的内核单调时钟（ns）。
+/// 见 [`K3MailboxIpiSender::notify_peer`] 内的写入点与 ioctl
+/// `RT_SHM_IOC_RD_KTS` 的读出路径。
+pub static LAST_PRE_DOORBELL_NS: AtomicU64 = AtomicU64::new(0);
+/// 投递诊断戳：上次对端门铃 IRQ handler 入口的内核单调时钟（ns）——
+/// 回程（RP 发响应门铃 → AP IRQ）投递耗时的 AP 侧端点。
+pub static LAST_IRQ_ENTRY_NS: AtomicU64 = AtomicU64::new(0);
 
 // ── IPI handler (raw function pointer for irq-framework) ───────────────────
 
@@ -535,6 +568,27 @@ fn flush_shm_window(vaddr: usize, size: usize) {
     );
 }
 
+/// `RT_SHM_IOC_NOTIFY`/`AWAIT` 的 arg 标志位（与用户态 ABI 头 rtshm-abi
+/// 的 `ARG_USER_CBO` 同值）：调用方已按行完成缓存发布/刷新，内核跳过
+/// 整窗同步点。
+const ARG_USER_CBO: usize = 1;
+
+/// AWAIT 就绪检查前的作废范围收缩（`ARG_USER_CBO` 路径）：`has_pending`
+/// 只读 ch1 的 magic/version 行 + 环索引行（read/write 同一 64B 行），
+/// 整窗 0x19000 作废缩成两行。
+///
+/// 偏移经 ov-channels 类型推导（`channel_unchecked` 拿 &Channel，RingBuffer
+/// 偏移 0x100），不硬编码通道地址；线性映射虚地址上的作废对 NC 别名读同样
+/// 生效（PIPT 同物理行）。
+fn invalidate_ch1_read_set(lin_vaddr: usize) {
+    // ov-channels 0.2.0：Channel 头 4B 后 RingBuffer 按 align(256) 落在 +0x100。
+    const RB_OFF: usize = 0x100;
+    let shm: &SharedMemory<DEFAULT_CHANNELS> = unsafe { SharedMemory::at(lin_vaddr) };
+    let ch1 = unsafe { shm.channel_unchecked(CH_FROM_RT_ASYNC) } as *const _ as usize;
+    invalidate_shm_window(ch1, 64);
+    invalidate_shm_window(ch1 + RB_OFF, 64);
+}
+
 // ── RtShmDevice ────────────────────────────────────────────────────────────
 
 enum IpiBackend {
@@ -568,8 +622,9 @@ pub struct RtShmDevice {
 }
 
 impl RtShmDevice {
-    /// 从 DT 配置构建设备：缓存同步点（boot invalidate）、内核 NC 别名、
-    /// 按 notifier 后端构造 IPI sender 并注册中断、boot 自测。
+    /// 从 DT 配置构建设备：缓存同步点（boot invalidate）、共享窗初始化
+    /// （init 职责自 RP 侧迁入，见下方）、内核 NC 别名、按 notifier 后端
+    /// 构造 IPI sender 并注册中断、boot 自测。
     ///
     /// # Panics
     ///
@@ -602,6 +657,28 @@ impl RtShmDevice {
         let vaddr = shm_nc.as_nonnull_ptr().as_ptr() as usize;
         let shm: &'static SharedMemory<DEFAULT_CHANNELS> = unsafe { SharedMemory::at(vaddr) };
         let access = unsafe { OvChannelsShmAccess::new(shm, CH_FROM_RT_ASYNC) };
+
+        // 共享窗初始化（职责自 RP 侧 intercom::init 迁移至此）。
+        //
+        // 窗口的三个破坏者——SPL 执行期、U-Boot `k3_clear_sram()` memset
+        // （发生在 bootm 之前）、bootm 换核的缓存 flush 写回——全部先于
+        // 内核启动，故 probe 期 init 的时机确定性排在它们之后；RP 侧因此
+        // 不再"盲等 3s 后写窗口"，改为只读等待本 init 完成。
+        //
+        // 顺序：boot invalidate（上方，已作废启动链脏行）→ init 写
+        // busy/magic/version/ring 头（经别名，板上实际走缓存）→ flush 把
+        // 头推到 SRAM（PIPT 同物理行，经线性映射虚地址 clean 同样生效；
+        // RP 直达 SRAM 无缓存，flush 返回即立即可见）。
+        //
+        // is_valid 守卫向后兼容对端先 init 的时序（如 QEMU 侧 RP 固件
+        // 仍保留 boot 期 init），亦避免 AP 重启时重复 init 清掉在途消息。
+        if shm.is_valid() {
+            ax_println!("rt_shm: shm window already valid, skip init (peer owns it)");
+        } else {
+            shm.init();
+            flush_shm_window(lin_vaddr, shm_size);
+            ax_println!("rt_shm: shm window initialized (init ownership migrated from rt-async)");
+        }
 
         let mut test_mbox = None;
         let ipi: IpiBackend = match notifier {
@@ -662,12 +739,10 @@ impl RtShmDevice {
                         rx_channel,
                     };
                     let request = IrqRequest::new(move |_ctx| {
-                        let now = K3_MBOX_IRQ_COUNT.fetch_add(1, Ordering::AcqRel) + 1;
-                        // 前 5 次打计数便于确认链路（boot 自测与 RP 多时段单点
-                        // 门铃；超出的不打印，防 notification 洪水刷屏）。
-                        if now <= 5 {
-                            ax_println!("rt_shm: mailbox IRQ fired (count={now})");
-                        }
+                        // 投递诊断戳：handler 入口（见 LAST_IRQ_ENTRY_NS 文档）。
+                        // 须先于 ack_and_clear 的 MMIO 舞步取时。
+                        LAST_IRQ_ENTRY_NS.store(monotonic_time_nanos(), Ordering::Relaxed);
+                        K3_MBOX_IRQ_COUNT.fetch_add(1, Ordering::AcqRel);
                         let event = endpoint.handle_irq();
                         if event == Event::PeerNotify {
                             wake_ipc_waiter();
@@ -789,13 +864,24 @@ impl DeviceOps for RtShmDevice {
         Err(VfsError::Unsupported)
     }
 
-    fn ioctl(&self, cmd: u32, _arg: usize) -> VfsResult<usize> {
+    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
         match cmd {
             RT_SHM_IOC_NOTIFY => {
-                // 通知前把窗口 clean+invalidate（DMA-to-device 屏障）：把本核
-                // 缓存可能滞留的写推到 SRAM 再打门铃（详见 flush_shm_window
-                // 注释），保证对端看到全部写入。
-                flush_shm_window(self.lin_vaddr, self.shm_size);
+                if arg & ARG_USER_CBO == 0 {
+                    // 通知前把窗口 clean+invalidate（DMA-to-device 屏障）：把本核
+                    // 缓存可能滞留的写推到 SRAM 再打门铃（详见 flush_shm_window
+                    // 注释），保证对端看到全部写入。
+                    flush_shm_window(self.lin_vaddr, self.shm_size);
+                } else {
+                    // ARG_USER_CBO：写发布已由调用方按行完成（cbo.flush 槽位+
+                    // 索引行，含 fence）。用户态发布与 ecall 之间无架构序保证，
+                    // 门铃 MMIO 写前补一道 fence 兜底（代替被跳过的整窗
+                    // flush 尾部的 fence）。
+                    #[cfg(target_arch = "riscv64")]
+                    unsafe {
+                        core::arch::asm!("fence rw, rw", options(nostack, preserves_flags));
+                    }
+                }
                 self.core.lock().notify_peer();
                 Ok(0)
             }
@@ -804,6 +890,10 @@ impl DeviceOps for RtShmDevice {
 
                 use ax_task::future::{block_on, interruptible};
                 let lin_vaddr = self.lin_vaddr;
+                // ARG_USER_CBO：返回后的用户态读新鲜度由调用方按行 refresh
+                // 负责，跳过返回前整窗 flush；就绪检查的作废也收缩为 ch1
+                // 实际读集（两行）。
+                let user_cbo = arg & ARG_USER_CBO != 0;
                 let _: Result<usize, VfsError> = block_on(interruptible(poll_fn(|cx| {
                     // X100 上 PBMT 不生效：SRAM 的 PMA 为 cacheable，ioremap
                     // 的"NC"别名读同样走缓存（板上实锤：RP 回包已落 SRAM，
@@ -811,7 +901,11 @@ impl DeviceOps for RtShmDevice {
                     // AWAIT 永久挂死，仅 60/120/180s ping 反复空唤醒）。
                     // 每次就绪检查前先作废窗口行，保证读到 SRAM 真值；poll
                     // 仅由 IRQ/伪唤醒驱动，频率低，CBO 开销可接受。
-                    invalidate_shm_window(lin_vaddr, self.shm_size);
+                    if user_cbo {
+                        invalidate_ch1_read_set(lin_vaddr);
+                    } else {
+                        invalidate_shm_window(lin_vaddr, self.shm_size);
+                    }
                     if self.core.lock().has_pending() {
                         return Poll::Ready(Ok(0usize));
                     }
@@ -823,7 +917,11 @@ impl DeviceOps for RtShmDevice {
                     // 误判"无数据"→ 注册 → 永久挂死。板上实锤：第 2 轮起 RP
                     // 暖态回程 µs 级，稳定踩中该窗口（wget 的 eth0 中断流把
                     // handler 推迟到注册之后，故 wget 后跑全过）。
-                    invalidate_shm_window(lin_vaddr, self.shm_size);
+                    if user_cbo {
+                        invalidate_ch1_read_set(lin_vaddr);
+                    } else {
+                        invalidate_shm_window(lin_vaddr, self.shm_size);
+                    }
                     if self.core.lock().has_pending() {
                         Poll::Ready(Ok(0usize))
                     } else {
@@ -839,11 +937,27 @@ impl DeviceOps for RtShmDevice {
                 // 点回包在 SRAM 存在 5s 仍对用户态不可读（仅 NOTIFY 的 flush
                 // 能让它显形）。协议安全性：本操作前后用户态不写共享窗
                 // （send→NOTIFY→AWAIT→recv 纪律），无部分行写回覆盖对端风险。
-                flush_shm_window(lin_vaddr, self.shm_size);
+                if !user_cbo {
+                    flush_shm_window(lin_vaddr, self.shm_size);
+                }
                 Ok(0)
             }
             RT_SHM_IOC_CLR_PENDING => Ok(0),
+            RT_SHM_IOC_FLUSH => {
+                // 与 NOTIFY 同款 DMA-to-device 屏障，但只 flush 不打门铃：
+                // 供 BUSY=1 跳过门铃的发送方发布缓存滞留写（见常量注释）。
+                flush_shm_window(self.lin_vaddr, self.shm_size);
+                Ok(0)
+            }
             RT_SHM_IOC_TEST_MBOX => self.test_k3_mailbox_irq(),
+            RT_SHM_IOC_RD_KTS => {
+                // 投递诊断读数（见常量注释）：arg = 用户态 *mut u64 数组（2 项）。
+                use crate::mm::UserPtr;
+                let out = UserPtr::<u64>::from(arg).get_as_mut_slice(2)?;
+                out[0] = LAST_PRE_DOORBELL_NS.load(Ordering::Relaxed);
+                out[1] = LAST_IRQ_ENTRY_NS.load(Ordering::Relaxed);
+                Ok(2)
+            }
             _ => Err(VfsError::InvalidInput),
         }
     }
