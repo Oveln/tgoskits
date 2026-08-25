@@ -14,45 +14,33 @@
 //! K3 为 mailbox4（AP=USER0/APLIC，RP=USER1/PLIC），RP 每写完一条消息即向
 //! AP 的 FIFO 投一条 new_msg。
 //!
-//! 用户态协议纪律：**send → NOTIFY → AWAIT → recv**。NOTIFY/AWAIT 是内核
-//! 缓存同步点（见下），偏离该纪律（如两次同步点之间再写共享窗）会触发
-//! 64B 行部分写回覆盖对端数据的经典非一致缓存风险。
+//! 用户态协议纪律：**send → NOTIFY → AWAIT → recv**。NOTIFY/AWAIT 是纯粹的
+//! 门铃/唤醒原语（无缓存维护语义，见下），偏离该纪律只影响唤醒时序。
 //!
-//! ## 缓存一致性模型（K3/X100 实测结论，2026-08-15）
+//! ## 缓存一致性模型（2026-08-26 PMA 定案）
 //!
-//! **X100 上 PTE 的 PBMT 属性不生效**（疑似 OpenSBI 未置 `menvcfg.PBMTE`，
-//! 被忽略且不报错）。PMA 按地址判定：mailbox 等 MMIO 天然非缓存（故一直
-//! "正常"），而共享 SRAM 是真 RAM，PMA=cacheable，PTE 写 PBMT=NC 压不住。
-//! 因此本驱动**不信任任何"NC 映射"语义**——内核 ioremap 别名与用户态
-//! mmap 的读写实际都走缓存；唯一可靠的一致性工具是显式 CBO（zicbom，
-//! 经 HAL `dcache_range` 分发）。四个同步点：
+//! 共享窗对 AP 侧（内核与用户态、任何映射路径）**物理非缓存**：X100 硅
+//! 忽略 Svpbmt PTE 位（内核 ioremap 别名 + 用户态 mmap 板测双实锤），由
+//! 配套 OpenSBI 固件（主仓 opensbi-k3 子仓 `feat/pma-audio-io`）在每 hart
+//! 启动时按界址定位覆盖窗口的 PMA entry 并翻为 IO（板上实测 entry4 =
+//! [0xc0800000, 0xc0880000)，vendor 代码固定写 byte6 实为写偏）。因此本
+//! 驱动**不含任何 CBO 缓存维护**——读写直达 SRAM，历史上的四个同步点
+//! （probe/mmap/NOTIFY/AWAIT）已全部撤除（每条 cbo 实测 ~160ns 纯开销）。
 //!
-//! | 时机 | 操作 | 方向/目的 |
-//! |---|---|---|
-//! | 设备初始化 | invalidate | 丢弃启动链（SPL/U-Boot cacheable 写）遗留脏行，杜绝迟到写回 |
-//! | mmap | invalidate | 清内核早期访问留下的驻留行，用户态首写直达 SRAM |
-//! | NOTIFY（门铃前） | clean+invalidate | for-device：把本核滞留写推到 SRAM 再通知对端 |
-//! | AWAIT（每次就绪检查前 + 返回前） | invalidate / clean+invalidate | for-cpu：读到对端已写入 SRAM 的回包真值 |
-//!
-//! 兜底：启动期早于初始化作废的写回，由 RP 侧 magic 自愈（幂等 re-init）
-//! 消化。长期课题：修通 PBMTE 后可省逐操作 CBO 开销（纯优化，协议不变）。
+//! 依赖与边界：K3 板必须刷上述固件（官方 opensbi 下窗口 PMA=cacheable，
+//! 本驱动会"看似能跑"但写被缓存吸收——用 user-test-pbmt 十秒判窗）；
+//! QEMU TCG 无 dcache，本模型天然成立。
 //!
 //! ## ioctl ABI
 //!
-//! * `RT_SHM_IOC_NOTIFY`：clean+invalidate 窗口后向 RP 发门铃（写完消息后调用）。
-//! * `RT_SHM_IOC_AWAIT`：阻塞至 ch1 有数据。就绪判定经内核映射（每次检查前
-//!   作废缓存）读环索引，**空门铃（对端 ping 无消息）只会空唤醒后重睡**，
-//!   不会假返回；返回前 clean+invalidate，保证随后用户态读为 SRAM 真值。
+//! * `RT_SHM_IOC_NOTIFY`：向 RP 发门铃（写完消息后调用；notifier 后端自带
+//!   Release fence + MMIO 写）。
+//! * `RT_SHM_IOC_AWAIT`：阻塞至 ch1 有数据。就绪判定经内核非缓存映射读
+//!   环索引，恒新鲜；**空门铃（对端 ping 无消息）只会空唤醒后重睡**，
+//!   不会假返回。
 //! * `RT_SHM_IOC_CLR_PENDING`：兼容占位（就绪状态由环索引推导，无需清除）。
 //! * `RT_SHM_IOC_TEST_MBOX`：软件注入 new_msg 自测中断全链路（K3 专用）。
-//! * `RT_SHM_IOC_FLUSH`：仅整窗 clean+invalidate，不发门铃（BUSY 跳过门铃
-//!   时的写发布点）。
-//!
-//! NOTIFY/AWAIT 的 arg 位 `ARG_USER_CBO`（=1，与用户态 ABI 头 rtshm-abi
-//! 同值）：调用方已启用 U 态 Zicbom 按行缓存维护（前置条件为 somehal
-//! `enable_user_cbo` 置 senvcfg），精确发布/刷新自己触碰的行——NOTIFY
-//! 跳过门铃前整窗 flush（仅补一道 fence），AWAIT 跳过返回前整窗 flush、
-//! 就绪检查作废缩至 ch1 magic+索引两行。arg=0 保持整窗语义不变。
+//! * `RT_SHM_IOC_RD_KTS`：读内核延迟插桩时间戳（诊断，K3 专用）。
 //!
 //! ## 设备树驱动配置
 //!
@@ -115,13 +103,9 @@ pub const RT_SHM_IOC_CLR_PENDING: u32 = 0x7350_03;
 /// AP 端纯自测：软件注入一条 mailbox new_msg，验证中断全链路
 /// （mailbox → APLIC → IMSIC → CPU → handler），无需对端参与。
 pub const RT_SHM_IOC_TEST_MBOX: u32 = 0x7350_04;
-/// 仅 flush 共享窗（clean+invalidate），不发门铃。跳过 NOTIFY 门铃的
-/// 发送方（对端 BUSY 自旋中，可省一次 IPI）用它发布缓存滞留的写（请求 /
-/// 已消费的 read 索引）到共享内存——NOTIFY 尾部的 flush 是用户态
-/// cacheable 映射下唯一的写发布点，跳过门铃时必须补纯 flush，否则请求
-/// 对对端不可见、产生幻影 pending 空唤醒循环（真板实测确认）。
-/// ioctl 号与用户态 ABI 头（rtshm-abi）保持同值。
-pub const RT_SHM_IOC_FLUSH: u32 = 0x7350_05;
+/// （已撤除）原 0x7350_05 = 仅整窗 flush 不发门铃——PMA 非缓存窗口后
+/// 无缓存可维护，ioctl 一并删除（用户态 ABI 头同步）。号位保留注释
+/// 防止误复用。
 /// 投递诊断读数：返回两个内核单调时钟戳（ns）——`[0]` 上次 NOTIFY 门铃
 /// MMIO 写前一瞬（`LAST_PRE_DOORBELL_NS`），`[1]` 上次对端门铃 IRQ
 /// handler 入口（`LAST_IRQ_ENTRY_NS`）。arg = 用户态 `*mut u64` 数组
@@ -527,68 +511,6 @@ fn ipi_irq_handler(_ctx: ax_runtime::hal::irq::IrqContext) -> ax_runtime::hal::i
     ax_runtime::hal::irq::IrqReturn::Handled
 }
 
-// ── Shared-window cache maintenance ────────────────────────────────────────
-
-/// 作废共享窗口在本核缓存中的陈旧行（丢弃，不写回）。
-///
-/// 三个调用场景（均为"for-cpu"同步点，详见模块文档「缓存一致性模型」）：
-/// * 设备初始化：丢弃启动链（BootROM/SPL/U-Boot cacheable 写）遗留的脏行，
-///   杜绝迟到写回覆盖 rt-async 数据（ch1/ch2 magic 被清零、SPL 指令字节
-///   "复活"、RPC 请求被覆盖——均为该根因的板上实锤）；
-/// * mmap：清掉内核早期 cacheable 访问可能留下的驻留行；
-/// * AWAIT 每次就绪检查前：X100 上 PBMT 不生效（见模块文档），ioremap
-///   "NC"别名的读也走缓存，首查取入的"空"状态会让重查恒 false——先作废
-///   再读才能看到对端已写入 SRAM 的回包。
-///
-/// 缓存操作经 HAL 平台实现分发（K3 走 zicbom cbo.inval + fence；无 zicbom
-/// 的平台退化为 DMA fence），本函数只作废缓存行、不改 SRAM 内容，对
-/// rt-async 已写入的数据无损。早于初始化作废发生的写回由 rt-async 侧的
-/// magic 自愈兜底（rt-async shm_ping：监视三通道 magic，丢失即幂等 re-init）。
-///
-/// 本函数刻意不打日志：AWAIT 每次（被唤醒后的）轮询都会调用，属高频路径。
-fn invalidate_shm_window(vaddr: usize, size: usize) {
-    ax_runtime::hal::mem::dcache_range(
-        ax_runtime::hal::mem::DCacheOp::Invalidate,
-        ax_memory_addr::VirtAddr::from(vaddr),
-        size,
-    );
-}
-
-/// 共享窗口 clean+invalidate（把本核缓存里可能滞留的写推到 SRAM 再作废）。
-///
-/// NOTIFY 前调用——DMA-to-device 同款所有权屏障：用户态 NC 写在个别缓存
-/// 层（如 LLC）存在驻留行时会被"吸收"不达 SRAM（板上实锤：AP 回读
-/// ch0.write=1 而 RP 读 0），clean 把滞留的新值推到 SRAM，invalidate 作废
-/// 副本，然后才打门铃，保证对端看到全部写入。
-fn flush_shm_window(vaddr: usize, size: usize) {
-    ax_runtime::hal::mem::dcache_range(
-        ax_runtime::hal::mem::DCacheOp::CleanInvalidate,
-        ax_memory_addr::VirtAddr::from(vaddr),
-        size,
-    );
-}
-
-/// `RT_SHM_IOC_NOTIFY`/`AWAIT` 的 arg 标志位（与用户态 ABI 头 rtshm-abi
-/// 的 `ARG_USER_CBO` 同值）：调用方已按行完成缓存发布/刷新，内核跳过
-/// 整窗同步点。
-const ARG_USER_CBO: usize = 1;
-
-/// AWAIT 就绪检查前的作废范围收缩（`ARG_USER_CBO` 路径）：`has_pending`
-/// 只读 ch1 的 magic/version 行 + 环索引行（read/write 同一 64B 行），
-/// 整窗 0x19000 作废缩成两行。
-///
-/// 偏移经 ov-channels 类型推导（`channel_unchecked` 拿 &Channel，RingBuffer
-/// 偏移 0x100），不硬编码通道地址；线性映射虚地址上的作废对 NC 别名读同样
-/// 生效（PIPT 同物理行）。
-fn invalidate_ch1_read_set(lin_vaddr: usize) {
-    // ov-channels 0.2.0：Channel 头 4B 后 RingBuffer 按 align(256) 落在 +0x100。
-    const RB_OFF: usize = 0x100;
-    let shm: &SharedMemory<DEFAULT_CHANNELS> = unsafe { SharedMemory::at(lin_vaddr) };
-    let ch1 = unsafe { shm.channel_unchecked(CH_FROM_RT_ASYNC) } as *const _ as usize;
-    invalidate_shm_window(ch1, 64);
-    invalidate_shm_window(ch1 + RB_OFF, 64);
-}
-
 // ── RtShmDevice ────────────────────────────────────────────────────────────
 
 enum IpiBackend {
@@ -609,9 +531,6 @@ pub struct RtShmDevice {
     core: SpinNoIrq<RtShmCore<OvChannelsShmAccess<DEFAULT_CHANNELS>, IpiBackend>>,
     shm_phys_base: usize,
     shm_size: usize,
-    /// 共享窗的内核线性映射虚地址（固定 PA 的确定值，new() 算一次）。
-    /// 四个缓存同步点（NOTIFY/AWAIT/mmap 及构造期）都经它做 CBO。
-    lin_vaddr: usize,
     /// 共享内存的 ioremap NC 别名映射句柄（保持映射存活；访问经其指针进行）。
     _shm_nc: mmio_api::MmioRaw,
     /// K3 mailbox 自测句柄（mmio + DT 配置的 rx_channel）：仅 K3 分支构造时
@@ -622,9 +541,8 @@ pub struct RtShmDevice {
 }
 
 impl RtShmDevice {
-    /// 从 DT 配置构建设备：缓存同步点（boot invalidate）、共享窗初始化
-    /// （init 职责自 RP 侧迁入，见下方）、内核 NC 别名、按 notifier 后端
-    /// 构造 IPI sender 并注册中断、boot 自测。
+    /// 从 DT 配置构建设备：共享窗初始化（init 职责自 RP 侧迁入，见下方）、
+    /// 内核别名映射、按 notifier 后端构造 IPI sender 并注册中断、boot 自测。
     ///
     /// # Panics
     ///
@@ -640,17 +558,10 @@ impl RtShmDevice {
 
         // SAFETY: Address from DT reserved SHM region. Layout matches M-mode
         // SharedMemory::<DEFAULT_CHANNELS> with the same feature configuration.
-        let lin_vaddr =
-            ax_runtime::hal::mem::phys_to_virt(PhysAddr::from(shm_phys_base)).as_ptr() as usize;
-        // K3：作废启动链（BootROM/SPL/U-Boot）遗留在缓存中的陈旧脏行，
-        // 杜绝迟到写回覆盖 rt-async 数据（详见 invalidate_shm_window 注释）。
-        invalidate_shm_window(lin_vaddr, shm_size);
-        ax_println!("rt_shm: stale boot-chain cache lines over shm window invalidated");
-        // 内核访问共享内存改走 ioremap 的 non-cacheable 别名（与 mailbox 同款），
-        // 不经 cacheable 线性映射：内核读（is_valid/has_pending）永远新鲜，
-        // 也不会在缓存里制造新的驻留行——驻留行会把用户态 NC 写"吸收"在
-        // 缓存里不达 SRAM（板上实锤：AP 回读 ch0.write=1 而 RP 读 0）。
-        // SAFETY: 地址来自 DT 保留区，与 M-mode 布局一致；NC 映射 lifetime
+        // （PMA 非缓存窗口：无需 boot 期整窗作废——启动链无法在缓存里留行，
+        // 读写直达 SRAM，见模块文档「缓存一致性模型」。）
+        // 内核访问共享内存走 ioremap 别名（与 mailbox 同款）：
+        // SAFETY: 地址来自 DT 保留区，与 M-mode 布局一致；映射 lifetime
         // 与设备相同（指针全程有效）。
         let shm_nc = unsafe { mmio_api::ioremap_raw(shm_phys_base.into(), shm_size) }
             .expect("rt_shm: failed to ioremap shm window");
@@ -665,10 +576,8 @@ impl RtShmDevice {
         // 内核启动，故 probe 期 init 的时机确定性排在它们之后；RP 侧因此
         // 不再"盲等 3s 后写窗口"，改为只读等待本 init 完成。
         //
-        // 顺序：boot invalidate（上方，已作废启动链脏行）→ init 写
-        // busy/magic/version/ring 头（经别名，板上实际走缓存）→ flush 把
-        // 头推到 SRAM（PIPT 同物理行，经线性映射虚地址 clean 同样生效；
-        // RP 直达 SRAM 无缓存，flush 返回即立即可见）。
+        // 顺序：init 写 busy/magic/version/ring 头（经别名，PMA 非缓存直达
+        // SRAM，RP 立即可见）。
         //
         // is_valid 守卫向后兼容对端先 init 的时序（如 QEMU 侧 RP 固件
         // 仍保留 boot 期 init），亦避免 AP 重启时重复 init 清掉在途消息。
@@ -676,7 +585,6 @@ impl RtShmDevice {
             ax_println!("rt_shm: shm window already valid, skip init (peer owns it)");
         } else {
             shm.init();
-            flush_shm_window(lin_vaddr, shm_size);
             ax_println!("rt_shm: shm window initialized (init ownership migrated from rt-async)");
         }
 
@@ -792,7 +700,6 @@ impl RtShmDevice {
             core: SpinNoIrq::new(core),
             shm_phys_base,
             shm_size,
-            lin_vaddr,
             _shm_nc: shm_nc,
             test_mbox,
         };
@@ -867,21 +774,6 @@ impl DeviceOps for RtShmDevice {
     fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
         match cmd {
             RT_SHM_IOC_NOTIFY => {
-                if arg & ARG_USER_CBO == 0 {
-                    // 通知前把窗口 clean+invalidate（DMA-to-device 屏障）：把本核
-                    // 缓存可能滞留的写推到 SRAM 再打门铃（详见 flush_shm_window
-                    // 注释），保证对端看到全部写入。
-                    flush_shm_window(self.lin_vaddr, self.shm_size);
-                } else {
-                    // ARG_USER_CBO：写发布已由调用方按行完成（cbo.flush 槽位+
-                    // 索引行，含 fence）。用户态发布与 ecall 之间无架构序保证，
-                    // 门铃 MMIO 写前补一道 fence 兜底（代替被跳过的整窗
-                    // flush 尾部的 fence）。
-                    #[cfg(target_arch = "riscv64")]
-                    unsafe {
-                        core::arch::asm!("fence rw, rw", options(nostack, preserves_flags));
-                    }
-                }
                 self.core.lock().notify_peer();
                 Ok(0)
             }
@@ -889,39 +781,15 @@ impl DeviceOps for RtShmDevice {
                 use core::{future::poll_fn, task::Poll};
 
                 use ax_task::future::{block_on, interruptible};
-                let lin_vaddr = self.lin_vaddr;
-                // ARG_USER_CBO：返回后的用户态读新鲜度由调用方按行 refresh
-                // 负责，跳过返回前整窗 flush；就绪检查的作废也收缩为 ch1
-                // 实际读集（两行）。
-                let user_cbo = arg & ARG_USER_CBO != 0;
                 let _: Result<usize, VfsError> = block_on(interruptible(poll_fn(|cx| {
-                    // X100 上 PBMT 不生效：SRAM 的 PMA 为 cacheable，ioremap
-                    // 的"NC"别名读同样走缓存（板上实锤：RP 回包已落 SRAM，
-                    // IRQ 唤醒后重查 has_pending 仍命中首查取入的陈旧行，
-                    // AWAIT 永久挂死，仅 60/120/180s ping 反复空唤醒）。
-                    // 每次就绪检查前先作废窗口行，保证读到 SRAM 真值；poll
-                    // 仅由 IRQ/伪唤醒驱动，频率低，CBO 开销可接受。
-                    if user_cbo {
-                        invalidate_ch1_read_set(lin_vaddr);
-                    } else {
-                        invalidate_shm_window(lin_vaddr, self.shm_size);
-                    }
                     if self.core.lock().has_pending() {
                         return Poll::Ready(Ok(0usize));
                     }
                     let mut guard = IPC_WAKER.lock();
-                    // 重查前必须**再作废一次**（锁内，SpinNoIrq 挡住中断）：
-                    // 首查读会把"空"快照取入缓存；若 RP 回包恰在首查与注册
-                    // waker 之间落 SRAM、且其门铃唤醒先于此处拿到锁（waker
-                    // 未注册，wake 为 no-op），锁内重查会命中首查的陈旧行而
-                    // 误判"无数据"→ 注册 → 永久挂死。板上实锤：第 2 轮起 RP
-                    // 暖态回程 µs 级，稳定踩中该窗口（wget 的 eth0 中断流把
-                    // handler 推迟到注册之后，故 wget 后跑全过）。
-                    if user_cbo {
-                        invalidate_ch1_read_set(lin_vaddr);
-                    } else {
-                        invalidate_shm_window(lin_vaddr, self.shm_size);
-                    }
+                    // 锁内重查（SpinNoIrq 挡住中断）：防回包恰落在首查与
+                    // waker 注册之间、且其门铃先于此处拿到锁（waker 未注册，
+                    // wake 为 no-op）的丢失唤醒。窗口非缓存，两次检查均读
+                    // SRAM 真值。
                     if self.core.lock().has_pending() {
                         Poll::Ready(Ok(0usize))
                     } else {
@@ -929,26 +797,9 @@ impl DeviceOps for RtShmDevice {
                         Poll::Pending
                     }
                 })))?;
-                // RP→AP 就绪同步点（for-cpu）：has_pending 经内核 NC 别名判定，
-                // 返回即 SRAM 里已有回包。此处 clean+invalidate 窗口——clean
-                // 把用户态滞留的脏行推出（不丢写），invalidate 作废陈旧驻留行
-                // （含 fetch 早于对端写的行），保证随后用户态读 ch1 直接取
-                // SRAM 真值。板上实锤：用户态映射实际 cacheable 时，无此同步
-                // 点回包在 SRAM 存在 5s 仍对用户态不可读（仅 NOTIFY 的 flush
-                // 能让它显形）。协议安全性：本操作前后用户态不写共享窗
-                // （send→NOTIFY→AWAIT→recv 纪律），无部分行写回覆盖对端风险。
-                if !user_cbo {
-                    flush_shm_window(lin_vaddr, self.shm_size);
-                }
                 Ok(0)
             }
             RT_SHM_IOC_CLR_PENDING => Ok(0),
-            RT_SHM_IOC_FLUSH => {
-                // 与 NOTIFY 同款 DMA-to-device 屏障，但只 flush 不打门铃：
-                // 供 BUSY=1 跳过门铃的发送方发布缓存滞留写（见常量注释）。
-                flush_shm_window(self.lin_vaddr, self.shm_size);
-                Ok(0)
-            }
             RT_SHM_IOC_TEST_MBOX => self.test_k3_mailbox_irq(),
             RT_SHM_IOC_RD_KTS => {
                 // 投递诊断读数（见常量注释）：arg = 用户态 *mut u64 数组（2 项）。
@@ -963,10 +814,6 @@ impl DeviceOps for RtShmDevice {
     }
 
     fn mmap(&self, _offset: u64, _length: u64) -> DeviceMmap {
-        // 用户态映射前再作废一次全窗缓存行：清掉任何驻留副本（内核早期
-        // cacheable 访问或残留），保证随后用户态的 NC 写直达 SRAM 而不是
-        // 被驻留行"吸收"（板上实锤：AP 回读自写成功而 RP 读不到）。
-        invalidate_shm_window(self.lin_vaddr, self.shm_size);
         DeviceMmap::Physical(
             PhysAddrRange::from_start_size(PhysAddr::from(self.shm_phys_base), self.shm_size),
             None,
