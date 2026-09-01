@@ -11,7 +11,9 @@ categories = ["embedded", "no-std", "hardware-support"]
 [dependencies]
 log = { workspace = true, optional = true }
 # ov-channels 提供共享内存通道的 ring-buffer 抽象。
-# features 必须与 M-mode 侧 (rt-async apps/rt-async-app) 保持一致：
-#   - "critical-section": portable-atomic 原子操作后端
+# features 必须与 M-mode 侧（rt-async apps）保持一致：
 #   - "flags": SharedMemory 顶部带 busy 标志，影响 struct 布局 —— 双端必须一致
-ov-channels = { version = "0.2", default-features = false, features = ["critical-section", "flags"] }
+# 0.3.0 起：窗口原子 = core load/store（不再有 critical-section feature，
+# portable-atomic 后端已移除）；is_valid 同时校验 magic 与 VERSION(=2)，
+# 双端 ov-channels 版本不一致时快速失败。
+ov-channels = { version = "0.3", default-features = false, features = ["flags"] }

@@ -122,7 +122,7 @@ vector = ["ax-cpu/vector"]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)', 'cfg(feature, values("ax-std"))'] }
 
 [dependencies]
-ov-channels = "0.2"
+ov-channels = { version = "0.3", default-features = false }
 k3_aiUabi = { git = "https://github.com/Dirinkbottle/k3x-HERA-RT.git", optional = true }
 k3_aiScheduler = { git = "https://github.com/Dirinkbottle/k3x-HERA-RT.git", optional = true }
 ax-alloc = { workspace = true }

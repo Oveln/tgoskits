@@ -336,3 +336,9 @@ x86 = "0.52"
 kmod-tools = "0.3"
 kprobe = "0.6"
 rt-shm = { version = "0.1.0", path = "drivers/ipc/rt-shm" }
+
+[patch.crates-io]
+# ov-channels 0.3.0 对齐（与 rt-async-amp 主仓 modules/ov-channels 同源）：
+# AP 内核与 M-mode 固件双端同版本，VERSION(=2) 门贯通。上游
+# crates.io 发布 0.3.0 后可移除本补丁改回 registry。
+ov-channels = { path = "../modules/ov-channels" }

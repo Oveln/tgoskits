@@ -4634,9 +4634,9 @@ dependencies = [
 
 [[package]]
 name = "jiff-tzdb"
-version = "0.1.8"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "142bd39932ad231f10513df9ab62661fead8719872150b7ad02a2df79f4e141e"
+checksum = "c900ef84826f1338a557697dc8fc601df9ca9af4ac137c7fb61d4c6f2dfd3076"
 
 [[package]]
 name = "jiff-tzdb-platform"
@@ -4792,7 +4792,7 @@ dependencies = [
  "k3_aiUabi",
  "k3_kernel_backend",
  "log",
- "ov-channels",
+ "ov-channels 0.2.0",
 ]
 
 [[package]]
@@ -5820,6 +5820,14 @@ checksum = "32c5cf43ed982e0e83a358dbc615a3c2af509bc060c7aa97f5ddf9020b51e7bf"
 dependencies = [
  "critical-section",
  "portable-atomic",
+ "postcard",
+ "serde",
+]
+
+[[package]]
+name = "ov-channels"
+version = "0.3.0"
+dependencies = [
  "postcard",
  "serde",
 ]
@@ -7283,7 +7291,7 @@ name = "rt-shm"
 version = "0.1.0"
 dependencies = [
  "log",
- "ov-channels",
+ "ov-channels 0.3.0",
 ]
 
 [[package]]
@@ -7943,9 +7951,9 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "simd_cesu8"
-version = "1.2.0"
+version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11031e251abf8611c80f460e19dbdeb54a66db918e49c65a7065b46ac7aec520"
+checksum = "94f90157bb87cddf702797c5dadfa0be7d266cdf49e22da2fcaa32eff75b2c33"
 dependencies = [
  "rustc_version",
  "simdutf8",
@@ -8240,7 +8248,7 @@ dependencies = [
  "mmio-api",
  "num_enum",
  "ouroboros",
- "ov-channels",
+ "ov-channels 0.3.0",
  "rand 0.10.2",
  "ranges-ext",
  "rbpf",
@@ -9711,9 +9719,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.9"
+version = "1.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+checksum = "0d46a5a140e6f7afeccd8eae97eff335163939eac8b929834875168b29b3d267"
 dependencies = [
  "rustls-pki-types",
 ]
